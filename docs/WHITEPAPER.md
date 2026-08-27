@@ -29,6 +29,89 @@ read occupancy so a trace cannot contradict itself, and a deliberate refusal to
 flag low occupancy ratios — and evaluates them on an Apple M1 Pro, including two
 real measurement bugs that the tool found in itself.
 
+The wider claim is that this is infrastructure an alternative to CUDA needs
+rather than a convenience for one codebase. A hardware claim is only as checkable
+as the instrument behind it, and on Apple silicon the measured-versus-spec gap is
+large enough — 1.5–1.7× on fp32, by different amounts per chip — that a
+spec-based roofline cannot be corrected into an honest one. The next section
+makes that case in full.
+
+---
+
+## Value proposition: the trust layer for a CUDA alternative
+
+CUDA's position rests on more than its GPUs. NVIDIA ships Nsight Compute
+alongside them, so a claim about a CUDA kernel arrives with a per-kernel
+roofline, an occupancy figure and a diff that someone else can reproduce. Apple
+silicon has the hardware argument and has had no ML-native equivalent of that
+instrument. Instruments answers instruction-level questions well (§2) but cannot
+answer *how far is this kernel from the best its shape allows on this chip* at
+all, because it does not know a GEMM from a softmax. metalscope is that missing
+layer — not a faster kernel, an instrument that makes claims about kernels
+checkable.
+
+**The structural difference from Nsight's approach is what the percentages are
+fractions of.** Nsight's speed-of-light figures are scored against published
+ceilings. metalscope scores against ceilings it measures on the machine in front
+of it, and §5.2 quantifies why that is not a stylistic preference here. Measured
+fp32 GEMM reaches 3.45 TF against a 5.2 TF spec figure on this M1 Pro (66%) and
+6.2 TF against 10.4 TF on an M1 Max (60%): the spec overstates reachable peak by
+roughly 1.5–1.7×, *by different amounts on the two chips*, while bandwidth specs
+over the same pair are nearly honest at 83% and 93%. Two roofs wrong by different
+ratios move the ridge point itself — 20.7 FLOP/byte measured against 26.0 from
+folklore on this M1 Pro — so no single fudge factor rescues a spec-based
+roofline; the correction changes which kernels are classified bandwidth-bound at
+all. The other half of the difference is upstream of the ceiling: arithmetic
+intensity computed analytically from ML kernel shape (§3.2), which a generic
+profiler cannot obtain because it sees a dispatch, not a matmul.
+
+**Credibility is what an instrument reports when reporting is inconvenient.**
+metalscope's calibrated ceilings are the reference the sibling projects in this
+suite score against: triton-metal's 2048 GEMM at 4.66 TFLOP/s is quoted as ~75%
+of the *measured* 6.2 TF M1 Max peak rather than of the 10.4 TF spec figure, and
+its attention comparison cites metalscope's ~744 GF measurement of an
+MPS-composite SDPA — a number that makes the composite it is measured against
+look better. What those papers publish includes the results that do not flatter:
+a GEMM round that landed at ~50% of MPS and missed the 60% it aimed at before a
+second round reached 76%; a codec verdict that went against every codec tested,
+all of them losing above 256 KiB on a 1.06 GB/s Thunderbolt link; a two-node
+data-parallel result that loses at every model size and crosses 1.0× only between
+a global batch of 1,024 and 4,096.
+
+The same standard applies inward. Both measurement bugs in §5.3 were found by
+pointing metalscope at metalscope — the counter-prefix bug that printed 541 GB/s
+on a 200 GB/s machine, and the clock-ramp bug that read the same GEMM at 0.88 TF
+or 3.3 TF depending on iteration count — and each is documented with the design
+rule it produced. §5.5 re-measured the tool's own observer effect against the
+figure the project's own documentation already carried and published the
+disagreement: the recorded ~35% at 4 MB holds, the claim of no difference beyond
+noise at 32 MB does not, where six runs show 7–12%. An instrument that reports
+against its own interest is the only kind whose favourable numbers mean anything.
+
+**The counter matrix is the community half of this.**
+[COUNTER-MATRIX.md](COUNTER-MATRIX.md) records what each chip and OS actually
+exposes, measured rather than read off a documentation page, because which sets
+`MTLDevice.counterSets` returns is a per-chip, per-OS fact nobody publishes. It
+has one fully measured row and one deliberately partial one (§6) — cells stay
+blank rather than being inferred from a sibling chip. Resolvers for the two sets
+no shipping Apple part exposes are written and unit-tested against synthetic
+data, so a chip that offers them populates `kernels[].counters` with no code
+change.
+
+**Where the CUDA tooling stack stays ahead.** Instruction-level stall reasons and
+bank conflicts are Instruments-only on Apple; Metal exposes no programmatic path
+to them and metalscope does not estimate them.
+There is no measured-occupancy counter anywhere in Metal — Nsight reads achieved
+occupancy from hardware, while metalscope derives a static upper bound from
+`MTLComputePipelineState` and labels it as one. Every Apple part run so far
+returns `timestamp` and nothing else from `MTLDevice.counterSets`, so there is no
+ALU-busy or memory-unit-busy signal to attribute time with. And `bench` and
+`profile` capture a single run per kernel with no best-of: §5.6 measured an
+unchanged RMS-norm baseline between 77 µs and 195 µs across five runs, which
+makes single-run diffs of microsecond-scale kernels noise-dominated. That last
+one is a tool limitation rather than a platform one, and §6 names it the
+highest-value next change.
+
 ---
 
 ## 1. Motivation
@@ -310,7 +393,7 @@ release`.
 
 ### 5.1 Test suite and coverage
 
-149 XCTest cases, all passing:
+156 XCTest cases, all passing:
 
 | suite | cases | what it covers |
 | --- | --- | --- |
@@ -322,6 +405,7 @@ release`.
 | `DiffTests` | 16 | alignment by label+shape+precision, positional pairing of repeats, occupancy comparison gating |
 | `KernelShapeTests` | 13 | analytic FLOP/byte models and stable JSON encoding |
 | `RooflineTests` | 12 | placement, bound classification, ridge tolerance |
+| `PeaksResolutionTests` | 7 | which peaks a report scores against — explicit file, trace-embedded measured peaks, folklore fallback — and every way an explicit file must error rather than silently fall back to folklore |
 
 Coverage of the two library targets, via `swift test --enable-code-coverage` and
 `xcrun llvm-cov report`:
@@ -337,7 +421,7 @@ Coverage of the two library targets, via `swift test --enable-code-coverage` and
 | `MetalscopeCore/Occupancy.swift` | 91.04% | 90.91% | 97.69% |
 | `MetalscopeCore/Roofline.swift` | 80.95% | 93.75% | 93.52% |
 | `MetalscopeCapture/CaptureSession.swift` | 76.97% | 85.29% | 90.69% |
-| **total** | **90.45%** | **94.22%** | **96.38%** |
+| **total** | **90.69%** | **94.27%** | **96.46%** |
 
 The largest remaining gap is deliberate and hardware-bound: 11 of
 `CaptureSession`'s 35 uncovered regions are the auxiliary-counter resolution

@@ -2,6 +2,14 @@
 
 An **ML-native kernel profiler for Metal** — what Nsight Compute is for CUDA.
 
+A competitive hardware claim is only as checkable as the instrument behind it,
+and Apple silicon has had no ML-native one. metalscope computes each kernel's
+arithmetic intensity analytically from its ML shape and scores it against
+ceilings **measured on your chip**, because published fp32 peaks overstate
+reachable GEMM by 1.5–1.7× — by different amounts on different chips, so no
+single correction factor rescues a spec-based roofline. It answers the question
+Instruments cannot: how far is this kernel from the best its shape allows here.
+
 Apple's Instruments GPU tooling exists but isn't ML-aware: it doesn't understand
 attention kernels, doesn't give you roofline analysis against your M-series chip's
 theoretical peaks, and can't diff two kernel versions side by side. metalscope does.
@@ -28,8 +36,8 @@ theoretical peaks, and can't diff two kernel versions side by side. metalscope d
 Milestones 1–5 of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) are implemented and
 exercised end-to-end on an M1 Pro: `info`, `calibrate`, `bench`, `profile`,
 `report`, and `diff` all work, with a documented JSON trace schema
-([docs/TRACE-FORMAT.md](docs/TRACE-FORMAT.md)) and **149 XCTest cases** (90.45%
-region / 94.22% function / 96.38% line coverage of the two library targets).
+([docs/TRACE-FORMAT.md](docs/TRACE-FORMAT.md)) and **156 XCTest cases** (90.69%
+region / 94.27% function / 96.46% line coverage of the two library targets).
 
 New to metalscope? [**docs/USAGE.md**](docs/USAGE.md) is the practical guide —
 the CLI end to end, a complete compiled example of instrumenting your own app,
