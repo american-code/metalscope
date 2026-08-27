@@ -181,14 +181,22 @@ enum DiffCommand {
                                 Fmt.signedPercent(delta)))
             if showsVerdict {
                 let noCall = diff.withinNoise
-                Terminal.out(String(format: "  %d moved beyond both spreads, %d within noise (no call)",
-                                    diff.resolved.count, noCall.count))
+                let unmeasured = matched.count - diff.resolved.count - noCall.count
+                var counts = "  \(diff.resolved.count) moved beyond both spreads, "
+                    + "\(noCall.count) within noise (no call)"
+                if unmeasured > 0 {
+                    counts += ", \(unmeasured) with no spread on one side"
+                }
+                Terminal.out(counts)
                 for entry in noCall {
-                    let s = entry.runStatistics!
+                    guard let s = entry.runStatistics else { continue }
+                    // Both spans in one unit: the whole point of printing them
+                    // together is that they are nearly the same number.
+                    let basis = max(s.baseline.p95, s.candidate.p95)
                     Terminal.out(String(format: "  - %@: %@ vs %@ — medians differ by %@, spreads overlap",
                                         entry.label,
-                                        Fmt.durationRange(s.baseline.min, s.baseline.p95),
-                                        Fmt.durationRange(s.candidate.min, s.candidate.p95),
+                                        Fmt.durationRange(s.baseline.min, s.baseline.p95, unitBasis: basis),
+                                        Fmt.durationRange(s.candidate.min, s.candidate.p95, unitBasis: basis),
                                         entry.durationDeltaFraction.map(Fmt.signedPercent) ?? "-"))
                 }
             }

@@ -64,19 +64,26 @@ public enum Fmt {
         return String(format: "%.3f s", seconds)
     }
 
-    /// A compact `low-high unit` span, both ends in the unit the *high* end
-    /// picks so the two numbers can be compared by eye. Used for the `spread`
-    /// column, where a full `Fmt.duration` on each end would double the width.
-    public static func durationRange(_ low: Double, _ high: Double) -> String {
+    /// A compact `low-high unit` span, both ends in one unit so the two numbers
+    /// can be compared by eye. Used for the `spread` column, where a full
+    /// `Fmt.duration` on each end would double the width.
+    ///
+    /// - Parameter unitBasis: the value that picks the unit, defaulting to
+    ///   `high`. Pass the larger of two ranges when printing them side by side:
+    ///   "0.959-1.002 ms vs 952.2-986.8 us" is two readings of nearly the same
+    ///   number and reads as neither.
+    public static func durationRange(_ low: Double, _ high: Double,
+                                     unitBasis: Double? = nil) -> String {
         guard low.isFinite, high.isFinite, low > 0, high > 0, high >= low else { return "-" }
+        let basis = unitBasis.map { $0.isFinite && $0 > 0 ? $0 : high } ?? high
         // Same precision per unit as `duration`, so a spread cell and a
         // time/iter cell in the same row can be read against each other.
         let scale: Double
         let unit: String
         let places: Int
-        if high < 1e-3 {
+        if basis < 1e-3 {
             (scale, unit, places) = (1e6, "us", 1)
-        } else if high < 1 {
+        } else if basis < 1 {
             (scale, unit, places) = (1e3, "ms", 3)
         } else {
             (scale, unit, places) = (1, "s", 3)

@@ -25,8 +25,9 @@ counters at all, which is every Apple chip shipped to date.
 The design commitment throughout is that a profiler must never print a
 confidently wrong number. This paper describes the mechanisms that enforce that
 — a three-tier timing ladder that degrades rather than extrapolates, derived-on-
-read occupancy so a trace cannot contradict itself, and a deliberate refusal to
-flag low occupancy ratios — and evaluates them on an Apple M1 Pro, including two
+read occupancy so a trace cannot contradict itself, a deliberate refusal to flag
+low occupancy ratios, and a diff that names no winner when the two kernels'
+measured spreads overlap — and evaluates them on an Apple M1 Pro, including two
 real measurement bugs that the tool found in itself.
 
 The wider claim is that this is infrastructure an alternative to CUDA needs
@@ -88,6 +89,18 @@ disagreement: the recorded ~35% at 4 MB holds, the claim of no difference beyond
 noise at 32 MB does not, where six runs show 7–12%. An instrument that reports
 against its own interest is the only kind whose favourable numbers mean anything.
 
+**The clearest expression of that is a diff that declines to answer.** Kernel
+optimisation is a loop whose whole payload is one bit — did that change help —
+and on microsecond kernels a single-run diff will report that bit confidently
+and at random: two captures of *identical* code read 1.95× apart (§5.6).
+metalscope now repeats each region, reports the median with its measured spread,
+and names a winner only when the two spreads are disjoint, stating that rule
+beside the table so a reader can check it. Across four captures of an unchanged
+baseline the rule cut kernel comparisons that would read as a result from 30 of
+36 to 4 of 36 — and §6 records the four rather than rounding them off. A tool
+that answers *no call* on a change too small to see is worth more than one that
+guesses, because the guess is what a week gets spent on.
+
 **The counter matrix is the community half of this.**
 [COUNTER-MATRIX.md](COUNTER-MATRIX.md) records what each chip and OS actually
 exposes, measured rather than read off a documentation page, because which sets
@@ -105,12 +118,10 @@ There is no measured-occupancy counter anywhere in Metal — Nsight reads achiev
 occupancy from hardware, while metalscope derives a static upper bound from
 `MTLComputePipelineState` and labels it as one. Every Apple part run so far
 returns `timestamp` and nothing else from `MTLDevice.counterSets`, so there is no
-ALU-busy or memory-unit-busy signal to attribute time with. And `bench` and
-`profile` capture a single run per kernel with no best-of: §5.6 measured an
-unchanged RMS-norm baseline between 77 µs and 195 µs across five runs, which
-makes single-run diffs of microsecond-scale kernels noise-dominated. That last
-one is a tool limitation rather than a platform one, and §6 names it the
-highest-value next change.
+ALU-busy or memory-unit-busy signal to attribute time with. Nsight also has the
+larger sample: its baseline workflow can lean on counters to explain a
+difference, where metalscope's honest answer to a small one is often to decline
+to name a winner at all (§5.6).
 
 ---
 
@@ -347,14 +358,14 @@ loses its reader.
 
 ## 4. Implementation
 
-metalscope is 3,702 lines of Swift across three targets, with no external
+metalscope is 4,143 lines of Swift across three targets, with no external
 package dependencies:
 
 | target | lines | contents |
 | --- | --- | --- |
-| `MetalscopeCore` | 1,234 | trace schema, shape registry, roofline math, occupancy math, diff, table/number formatting. No Metal import; usable in analysis tools |
-| `MetalscopeCapture` | 777 | the opt-in capture API, plus per-counter-set resolvers |
-| `metalscope` (CLI) | 1,691 | `info`, `calibrate`, `bench`, `profile`, `report`, `diff` |
+| `MetalscopeCore` | 1,469 | trace schema, shape registry, roofline math, occupancy math, repeat statistics, diff, table/number formatting. No Metal import; usable in analysis tools |
+| `MetalscopeCapture` | 839 | the opt-in capture API, plus per-counter-set resolvers |
+| `metalscope` (CLI) | 1,835 | `info`, `calibrate`, `bench`, `profile`, `report`, `diff` |
 
 **Counter resolvers.** `CaptureSession` keeps a resolver per counter set rather
 than hardcoding timestamps. Each of Apple's three common sets resolves to a
@@ -378,10 +389,12 @@ are among the properties that make a profiler untrustworthy, and they would not
 have solved the underlying problem anyway, since without dispatch-boundary
 sampling there is nothing useful to do with an intercepted encoder.
 
-**Trace format.** One JSON schema (currently v2), pretty-printed with sorted keys
+**Trace format.** One JSON schema (currently v3), pretty-printed with sorted keys
 so two traces can be compared with plain `diff` as well as with `metalscope
-diff`. Every v2 addition is optional, so v1 traces still read; readers reject
-schema versions newer than they understand.
+diff`. Every addition since v1 is optional, so older traces still read; readers
+reject schema versions newer than they understand. v3 stores the per-repeat
+duration samples and nothing derived from them — min, median, mean and p95 are
+computed on read, on the same principle as §3.4.
 
 ---
 
@@ -393,16 +406,17 @@ release`.
 
 ### 5.1 Test suite and coverage
 
-156 XCTest cases, all passing:
+194 XCTest cases, all passing:
 
 | suite | cases | what it covers |
 | --- | --- | --- |
-| `TextTableTests` | 31 | table layout (alignment, column sizing, ragged rows, trailing whitespace, Character-vs-byte widths) and every `Fmt` numeric formatter, including NaN, infinity, unit boundaries and clamping |
-| `CaptureTests` | 22 | GPU-dependent: capture path, timing ladder, occupancy recording, trace round trip, sample-buffer exhaustion, environment trace path |
-| `TraceTests` | 19 | schema v1/v2 round trips, version gate in both directions, timestamp parsing and failure, derived kernel numbers |
+| `TextTableTests` | 34 | table layout (alignment, column sizing, ragged rows, trailing whitespace, Character-vs-byte widths) and every `Fmt` numeric formatter, including NaN, infinity, unit boundaries, clamping, and shared-unit duration spans |
+| `CaptureTests` | 26 | GPU-dependent: capture path, timing ladder, repeats and warm-up discipline, occupancy recording, trace round trip, sample-buffer exhaustion, environment trace path |
+| `DiffTests` | 25 | alignment by label+shape+precision, positional pairing, occupancy comparison gating, and the verdict rule in every configuration (disjoint, overlapping, touching, single-run on either side) |
+| `TraceTests` | 24 | schema v1/v2/v3 round trips, version gate in both directions, timestamp parsing and failure, derived kernel numbers, and that no derived statistic is ever stored |
 | `OccupancyTests` | 19 | derived ratios, limiter classification, folding several dispatch shapes into one record |
 | `CounterResolverTests` | 17 | struct-layout invariants and aggregation rules for all three counter sets, against synthetic resolved data |
-| `DiffTests` | 16 | alignment by label+shape+precision, positional pairing of repeats, occupancy comparison gating |
+| `RunStatisticsTests` | 17 | median, mean, nearest-rank p95 and interval overlap, including that median and p95 are always observed samples |
 | `KernelShapeTests` | 13 | analytic FLOP/byte models and stable JSON encoding |
 | `RooflineTests` | 12 | placement, bound classification, ridge tolerance |
 | `PeaksResolutionTests` | 7 | which peaks a report scores against — explicit file, trace-embedded measured peaks, folklore fallback — and every way an explicit file must error rather than silently fall back to folklore |
@@ -416,15 +430,16 @@ Coverage of the two library targets, via `swift test --enable-code-coverage` and
 | `MetalscopeCore/Trace.swift` | 100.00% | 100.00% | 100.00% |
 | `MetalscopeCore/PeaksStore.swift` | 100.00% | 100.00% | 100.00% |
 | `MetalscopeCore/KernelShape.swift` | 98.75% | 100.00% | 100.00% |
-| `MetalscopeCore/Diff.swift` | 96.49% | 100.00% | 99.20% |
+| `MetalscopeCore/Diff.swift` | 97.56% | 100.00% | 99.37% |
 | `MetalscopeCapture/CounterResolvers.swift` | 92.06% | 100.00% | 100.00% |
+| `MetalscopeCore/RunStatistics.swift` | 91.67% | 100.00% | 100.00% |
 | `MetalscopeCore/Occupancy.swift` | 91.04% | 90.91% | 97.69% |
 | `MetalscopeCore/Roofline.swift` | 80.95% | 93.75% | 93.52% |
-| `MetalscopeCapture/CaptureSession.swift` | 76.97% | 85.29% | 90.69% |
-| **total** | **90.69%** | **94.27%** | **96.46%** |
+| `MetalscopeCapture/CaptureSession.swift` | 78.03% | 83.54% | 90.93% |
+| **total** | **91.16%** | **93.96%** | **96.57%** |
 
 The largest remaining gap is deliberate and hardware-bound: 11 of
-`CaptureSession`'s 35 uncovered regions are the auxiliary-counter resolution
+`CaptureSession`'s 38 uncovered regions are the auxiliary-counter resolution
 path, which cannot execute on a chip that exposes only `timestamp`. Its
 aggregation *rules* are covered synthetically in `CounterResolverTests`; only
 the Metal plumbing around them is dark. The CLI target is not in this table —
@@ -517,11 +532,13 @@ run length is measuring the power manager.
 
 The effect is not confined to calibration, as the tool re-demonstrated during
 the writing of [USAGE.md](USAGE.md). The example transformer block initially ran
-32 iterations per region, and its MPS QKV projection measured 55.4% of the
+32 iterations per region, and its MPS QKV projection measured 44.3% of the
 compute ceiling. Raising the two microsecond-scale kernels ahead of it from 32
 to 2048 iterations — leaving the GEMM's own iteration count untouched — moved
-that same GEMM to **97.8%**, because the GPU was now fully clocked by the time
-it ran. A kernel's measured efficiency depends on what ran before it.
+that same GEMM to **95.2%**, because the GPU was now fully clocked by the time
+it ran. A kernel's measured efficiency depends on what ran before it. The
+`spread` column now says as much in the row itself: at the small size that GEMM
+reads 198.1–324.7 µs, a band half as wide as its own median.
 
 ### 5.4 The `act.scale` occupancy finding
 
@@ -534,27 +551,30 @@ genuine structural defect to find on any chip. The analysis finds it:
     threadgroup      100 threads of a 1024 max (9.8% occupancy)
     simd groups      4 x 32 lanes, 28 idle (78.1% lane use)
     threadgroup mem  0 B of 32.0 KB
-    dispatches       167773 threadgroups/dispatch, 172 encoded
+    dispatches       167773 threadgroups/dispatch, 188 encoded
     limiter          threadgroup of 100 is not a multiple of the 32-wide SIMD
                      group — 28 of 128 lanes idle in every threadgroup (78.1%
                      lane use); round to 96 or 128
 ```
 
-Scored against peaks measured in the same machine state, the report adds the
-clause that makes this the tool's signature output:
+The report adds the clause that makes this the tool's signature output:
 
-> *…round to 96 or 128; **note it is already at 100.9% of its bandwidth ceiling,
+> *…round to 96 or 128; **note it is already at 93.0% of its bandwidth ceiling,
 > so this costs lanes, not time**.*
 
 The defect is real — 28 of every 128 lanes launch with nothing to do — and
 fixing it wins back nothing, because the kernel is already saturating memory
-bandwidth. Confirmed by the `tuned` variant, which fixes the threadgroup to 256
-and moves the kernel by **1.02×**.
+bandwidth. The `tuned` variant, which fixes the threadgroup to 256, confirms it
+twice over: the limiter clears, and the timing verdict is **`no call`** — the
+two runs' spreads overlap, so the diff declines to claim the fix bought any
+time at all. Before repeats existed this same comparison printed a confident
+1.02×, which was the noise.
 
 The contrasting case appears in the [USAGE.md](USAGE.md) worked example, whose
 RMS-norm kernel dispatches 32-wide threadgroups (a `tinyThreadgroup` limiter) at
-62.6% of its bandwidth ceiling — below the 90% caveat threshold, so no caveat is
-printed. Widening it to 256 threads yields **1.25×** and clears the limiter.
+64.6% of its bandwidth ceiling — below the 90% caveat threshold, so no caveat is
+printed. Widening it to 256 threads yields **1.29×**, clears the limiter, and is
+the one row in that diff the overlap rule resolves as `faster`.
 
 Two structurally similar occupancy findings, two opposite recommendations,
 distinguished automatically by the roofline cross-check. Neither Instruments nor
@@ -563,8 +583,8 @@ knowing the ceiling.
 
 A third observation from the same example: the occupancy finding was the *only*
 thing that survived bad benchmarking. Profiling the block at a 512 KB working
-set instead of 4 MB moved every roofline efficiency (12.4% → 62.6%, 55.4% →
-97.8%, 7.7% → 43.8%, 15.7% → 100.8%) while the `tinyThreadgroup` limiter
+set instead of 4 MB moved every roofline efficiency (21.8% → 64.6%, 44.3% →
+95.2%, 9.8% → 41.0%, 16.5% → 93.2%) while the `tinyThreadgroup` limiter
 appeared identically in both. Structural facts are robust to methodology in a
 way that timing is not — which is an argument for reporting them at all.
 
@@ -602,21 +622,82 @@ difference beyond noise at 32 MB — holds at 4 MB but is too optimistic at 32 M
 where six runs show a consistent 7–12%. The overhead does become negligible,
 later than previously claimed.
 
-### 5.6 Two incidental findings
+### 5.6 Repeats, spread, and refusing to call a winner
 
 **Metal caps a counter sample buffer at 32 KB on this chip** — 4,096 timestamps,
 so roughly 2,048 sampled encoders per region. metalscope treats an over-large
 request as a reason to abandon sampling for that region and time the command
 buffer instead, rather than failing the capture.
 
-**Single-run diffs of short kernels are noise-dominated.** `bench` and `profile`
-capture one run per kernel with no best-of. The same unchanged RMS-norm baseline
-measured between 77 µs and 195 µs across five runs, making one fix look like
-anything from 1.02× to 2.16×; in a `bench`-to-`bench` diff, `ffn.gemm` moved
-from 66.1% to 94.3% of the compute ceiling with no code change at all, because
-MPS took a different path for the same shape. The `occupancy changes:` section
-is the part of a diff that can be trusted from a single pair of runs, because it
-reports a change in shape rather than a stopwatch reading.
+**A single run per kernel is not a measurement.** Timing one region and dividing
+by its iteration count controls the clock ramp (§5.3) but says nothing about
+run-to-run variance, which on a microsecond kernel is the larger term. Four
+captures of an unchanged `bench --variant baseline` at a small working set,
+one timed run each, spread as follows:
+
+```
+  kernel         single-run, 4 captures    5 repeats, 4 captures
+  -------------  -----------------------  -----------------------
+  ffn.gemm       156.8 -  349.9 us  2.23x  104.7 - 108.8 us  1.04x
+  ffn.gemm.half  124.6 -  289.4 us  2.32x   94.3 -  98.7 us  1.05x
+  attn.sdpa      170.1 -  333.5 us  1.96x  172.6 - 178.3 us  1.03x
+  block.rmsnorm   58.4 -   92.8 us  1.59x   58.9 -  61.9 us  1.05x
+  act.scale       51.6 -   67.2 us  1.30x   49.6 -  51.0 us  1.03x
+  stream.triad    64.6 -   80.7 us  1.25x   58.7 -  62.9 us  1.07x
+```
+
+A diff of two of those single-run captures — of *identical* code — reports
+`ffn.gemm` 1.95× faster, `ffn.gemm.half` 0.43×, `attn.sdpa` 0.51×, and moves
+`block.rmsnorm` 32 percentage points of its bandwidth ceiling. Every one of
+those numbers is a stopwatch reading presented as a result.
+
+The fix has three parts, and the third is the one that matters.
+
+**Repeat, and warm up first.** `bench --repeats N` (default 5) and the capture
+API's `repeats:` run N timed regions per kernel, preceded by one discarded
+region at the same iteration count — the same probe-then-measure shape
+`calibrate` already used, applied to the repeat loop so that no timed sample
+pays the clock ramp. On a 64 MB working set this collapses `ffn.gemm`'s
+across-capture spread from 48.8% to 1.6%, because the ramp had been landing
+entirely on the first capture's first run.
+
+**Record the samples, derive the summary.** Schema v3 stores every
+per-invocation sample in `kernels[].durationSamplesSeconds`; min, median, mean
+and p95 are computed on read, the same derived-on-read discipline as the
+occupancy ratios in §3.4 and for the same reason. `report` prints the median
+with a min–p95 spread column, and every other column in the row is computed
+from that median — so a wide spread is a warning about the whole row. The median
+is the *lower* of the two middle samples on an even count and p95 is
+nearest-rank rather than interpolated, so both numbers a report prints are runs
+that happened rather than arithmetic between two that did.
+
+**Refuse the call.** `diff` compares medians and withholds a verdict when the
+two `[min, p95]` intervals overlap, printing the rule beside the table:
+
+```
+  kernel         baseline  candidate  delta  speedup  verdict
+  -------------  --------  ---------  -----  -------  -------
+  ffn.gemm      107.12 us  104.70 us  -2.3%    1.02x  no call
+  ffn.gemm.half  97.84 us   94.27 us  -3.7%    1.04x  no call
+  ...
+  1 moved beyond both spreads, 5 within noise (no call)
+  - ffn.gemm: 101.2-154.1 us vs 99.7-146.0 us — medians differ by -2.3%, spreads overlap
+```
+
+The delta is still printed. What is withheld is the interpretation, and the
+withholding is the feature: the reliable failure mode of a diff is not a wrong
+number but a real number that the reader takes for a result.
+
+Measured over all six pairings of those four unchanged captures: single-run
+comparisons showed a >5% delta in **30 of 36** kernel pairs, worst 132%; at five
+repeats, **4 of 36** produced a verdict at all, worst median gap 7.2%. The rule
+narrows the false-positive rate by roughly an order of magnitude and does not
+abolish it — §6 says so, because four marginal calls out of thirty-six is the
+number, not zero.
+
+The `occupancy changes:` section remains the part of a diff that a single pair of
+runs can support, because it reports a change in shape rather than a stopwatch
+reading.
 
 ---
 
@@ -649,10 +730,16 @@ conflating the two would be the same class of error as the two bugs in §5.3.
 not deferred features; Metal exposes no programmatic path to them. metalscope
 says so rather than estimating them.
 
-**No best-of in `bench` and `profile`.** §5.6 shows the cost. The obvious fix —
-repeat each region and keep the fastest, as `calibrate` already does — would
-make single-run diffs meaningful for microsecond-scale kernels and is the
-highest-value next change.
+**A diff can still call a marginal winner.** `bench` and `profile` repeat each
+region (`--repeats`, default five) behind one discarded warm-up, record every
+sample, and report the median with its min–p95 spread; `diff` refuses to name a
+winner when two spreads overlap (§5.6). The refusal narrows the false-positive
+rate rather than removing it: across all six pairings of four captures of an
+unchanged microsecond-scale baseline, 4 of 36 kernel comparisons still produced
+a verdict, the widest on a 7.2% median gap. Those are marginal calls rather than
+the 2× ones single-run diffs produced, but a threshold rule cannot distinguish a
+genuine 5% win from an unlucky pair of five-sample intervals. More repeats
+narrow the intervals; nothing makes the question go away.
 
 **The roofline is single-level.** A cache-aware or hierarchical roofline would
 explain the >100% efficiencies directly rather than by inference. That needs
@@ -675,7 +762,7 @@ things Apple's tooling does not provide: an arithmetic intensity derived from
 knowing what the kernel computes, and a ceiling derived from measuring the
 hardware rather than multiplying its specifications.
 
-metalscope supplies both in 3,702 lines of dependency-free Swift, and the
+metalscope supplies both in 4,143 lines of dependency-free Swift, and the
 recurring theme of its design is a refusal to fill gaps with plausible numbers.
 When the timing path cannot cover a whole region, it degrades a tier and says
 so. When metalscope never saw a pipeline, the occupancy column prints a dash.

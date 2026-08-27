@@ -26,25 +26,33 @@ theoretical peaks, and can't diff two kernel versions side by side. metalscope d
   waste from threadgroups that aren't a multiple of the SIMD width, threadgroup
   memory pressure — derived from `MTLComputePipelineState`, so it works on chips
   that expose no occupancy counters at all (which is all of them).
-- **Kernel diffing**: profile two versions, get a side-by-side of where the time,
-  the roofline placement, and the threadgroup shape moved.
+- **Kernel diffing that refuses to guess**: profile two versions, get a
+  side-by-side of where the time, the roofline placement, and the threadgroup
+  shape moved — with each kernel repeated, its median reported alongside the
+  measured spread, and **no winner named when the two spreads overlap**. On
+  microsecond kernels that is the difference between a result and a stopwatch
+  reading: two captures of unchanged code can read 1.95x apart.
 - **`calibrate`**: measures real peak GEMM/streaming numbers on your chip so
   efficiency percentages are honest.
 
 ## Status
 
-Milestones 1–5 of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) are implemented and
+Milestones 1–6 of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) are implemented and
 exercised end-to-end on an M1 Pro: `info`, `calibrate`, `bench`, `profile`,
 `report`, and `diff` all work, with a documented JSON trace schema
-([docs/TRACE-FORMAT.md](docs/TRACE-FORMAT.md)) and **156 XCTest cases** (90.69%
-region / 94.27% function / 96.46% line coverage of the two library targets).
+([docs/TRACE-FORMAT.md](docs/TRACE-FORMAT.md)) and **194 XCTest cases** (91.16%
+region / 93.96% function / 96.57% line coverage of the two library targets).
+CI runs `swift build` and `swift test` on macOS arm64 for every push
+([workflow](.github/workflows/ci.yml)); GPU-dependent tests skip cleanly on a
+runner without stage-boundary sampling.
 
 New to metalscope? [**docs/USAGE.md**](docs/USAGE.md) is the practical guide —
 the CLI end to end, a complete compiled example of instrumenting your own app,
 and how to read every column. Every transcript in it was produced by running the
 command above it on this machine. [**docs/WHITEPAPER.md**](docs/WHITEPAPER.md)
 is the argument and the evaluation: the design rationale, measured-vs-spec-sheet
-peaks on two chips, and the two measurement bugs the tool found in itself.
+peaks on two chips, the two measurement bugs the tool found in itself, and what
+repeating a measurement does and does not fix.
 
 What is *not* here, and why: no Apple chip metalscope has run on exposes an
 occupancy or utilization counter. On this machine (macOS 26.5.1, M1 Pro) the only
@@ -112,7 +120,8 @@ under `metalscope profile -- ./your-benchmark` (see
 region to get occupancy recorded alongside the timing:
 
 ```swift
-try session.capture(label: "qkv", shape: .gemm(m: 1024, n: 1024, k: 1024)) { region in
+try session.capture(label: "qkv", shape: .gemm(m: 1024, n: 1024, k: 1024),
+                    repeats: 5) { region in       // + one discarded warm-up
     let encoder = try region.makeComputeCommandEncoder()
     encoder.setBuffer(out, offset: 0, index: 0)
     region.dispatchThreads(encoder, pipeline: pipeline,
@@ -121,40 +130,47 @@ try session.capture(label: "qkv", shape: .gemm(m: 1024, n: 1024, k: 1024)) { reg
 }
 ```
 
+`repeats` defaults to 1. Pass it (or `bench --repeats N`, default 5) and the
+trace records every sample, so `report` can show the spread and `diff` can tell
+a change from the noise.
+
 ### 3. Report
 
 ```
 $ metalscope report baseline.json
 roofline report — baseline.json
-  device:  Apple M1 Pro   captured 2026-08-26T19:33:41Z
+  device:  Apple M1 Pro   captured 2026-08-27T19:39:08Z
   peaks:   3.45 TF fp32 / 3.33 TF fp16 / 166.4 GB/s  [measured]
   ridge:   20.7 FLOP/byte (fp32), 20.0 FLOP/byte (fp16)
+  repeats: 5 timed runs per kernel
 
-  kernel         shape                    prec  time/iter   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
-  -------------  -----------------------  ----  ---------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
-  ffn.gemm       gemm 1024x1024x1024      fp32   1.076 ms   2.00 TF   11.7   171  compute     3.45 TF  57.9%       -      -  cmdbuf
-  ffn.gemm.half  gemm 1024x1024x1024      fp16  689.62 us   3.11 TF    9.1   341  compute     3.33 TF  93.4%       -      -  cmdbuf
-  attn.sdpa      attn b1 h8 s512 d64      fp32  734.98 us  730.5 GF    5.7   128  compute     3.45 TF  21.2%       -      -  cmdbuf
-  block.rmsnorm  norm n=16777216          fp32  851.22 us   98.5 GF  157.7  0.62  bandwidth  104.0 GF  94.8%     256  25.0%  counters
-  act.scale      elem n=16777216          fp32  842.34 us   19.9 GF  159.3  0.12  bandwidth   20.8 GF  95.8%    100*   9.8%  counters
-  stream.triad   opaque 33.55MF/201.33MB  fp32   1.233 ms   27.2 GF  163.3  0.17  bandwidth   27.7 GF  98.1%     256  25.0%  counters
+  kernel         shape                    prec  time/iter          spread   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
+  -------------  -----------------------  ----  ---------  --------------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
+  ffn.gemm       gemm 1024x1024x1024      fp32  674.14 us  668.7-680.4 us   3.19 TF   18.7   171  compute     3.45 TF  92.4%       -      -  cmdbuf
+  ffn.gemm.half  gemm 1024x1024x1024      fp16  706.90 us  701.1-715.4 us   3.04 TF    8.9   341  compute     3.33 TF  91.2%       -      -  cmdbuf
+  attn.sdpa      attn b1 h8 s512 d64      fp32  749.20 us  745.5-751.7 us  716.6 GF    5.6   128  compute     3.45 TF  20.8%       -      -  cmdbuf
+  block.rmsnorm  norm n=16777216          fp32  894.00 us  877.5-912.4 us   93.8 GF  150.1  0.62  bandwidth  104.0 GF  90.2%     256  25.0%  counters
+  act.scale      elem n=16777216          fp32  866.91 us  866.3-884.3 us   19.4 GF  154.8  0.12  bandwidth   20.8 GF  93.0%    100*   9.8%  counters
+  stream.triad   opaque 33.55MF/201.33MB  fp32   1.271 ms  1.266-1.307 ms   26.4 GF  158.4  0.17  bandwidth   27.7 GF  95.2%     256  25.0%  counters
 
   headroom:
-  - attn.sdpa is compute-bound at 21.2% of the compute ceiling (unfused: s x s scores round-trip through DRAM)
+  - attn.sdpa is compute-bound at 20.8% of the compute ceiling (unfused: s x s scores round-trip through DRAM)
   - act.scale: threadgroup of 100 is not a multiple of the 32-wide SIMD group — 28 of 128 lanes
-    idle in every threadgroup (78.1% lane use); round to 96 or 128; note it is already at 95.8%
+    idle in every threadgroup (78.1% lane use); round to 96 or 128; note it is already at 93.0%
     of its bandwidth ceiling, so this costs lanes, not time
 ```
 
-`tgroup` is threads per threadgroup, starred when it isn't a multiple of the SIMD
-width; `occ` is that against the pipeline's own ceiling. A dash means metalscope
-never saw the pipeline — MPS encodes its own dispatches, and a guess would be
-worse than a blank.
+`time/iter` is the median of five timed runs and `spread` is that median's noise
+band, min to nearest-rank p95 — every other column is computed from the median,
+so a wide spread discounts the whole row. `tgroup` is threads per threadgroup,
+starred when it isn't a multiple of the SIMD width; `occ` is that against the
+pipeline's own ceiling. A dash means metalscope never saw the pipeline — MPS
+encodes its own dispatches, and a guess would be worse than a blank.
 
 That last headroom line is the shape of the whole tool: the analysis found a real
 structural defect (the `bench` baseline plants one on purpose), *and* checked it
 against the roofline before telling you to go fix it. A ragged threadgroup in a
-kernel already at 95.8% of measured bandwidth is wasted lanes, not wasted time.
+kernel already at 93.0% of measured bandwidth is wasted lanes, not wasted time.
 
 ### 4. Occupancy detail
 
@@ -166,14 +182,14 @@ $ metalscope report baseline.json --occupancy
     threadgroup      100 threads of a 1024 max (9.8% occupancy)
     simd groups      4 x 32 lanes, 28 idle (78.1% lane use)
     threadgroup mem  0 B of 32.0 KB
-    dispatches       167773 threadgroups/dispatch, 192 encoded
+    dispatches       167773 threadgroups/dispatch, 188 encoded
     limiter          threadgroup of 100 is not a multiple of the 32-wide SIMD group ...
 
   block.rmsnorm
     threadgroup      256 threads of a 1024 max (25.0% occupancy)
     simd groups      8 x 32 lanes, fully packed
     threadgroup mem  128 B of 32.0 KB (0.4%) — at most 256 fit that limit
-    dispatches       16384 threadgroups/dispatch, 171 encoded
+    dispatches       16384 threadgroups/dispatch, 176 encoded
     limiter          nothing structural stands out
 ```
 
@@ -186,20 +202,33 @@ that's a single SIMD group, or threadgroup memory over half the device limit.
 
 ```
 $ metalscope diff baseline.json tuned.json
-  kernel         shape                     baseline  candidate   delta  speedup        eff a->b     d eff  tgroup a->b  bound
-  -------------  -----------------------  ---------  ---------  ------  -------  --------------  --------  -----------  ---------
-  ffn.gemm       gemm 1024x1024x1024       1.076 ms  648.47 us  -39.7%    1.66x  57.9% -> 96.1%  +38.2 pp            -  compute
-  act.scale      elem n=16777216          842.34 us  861.01 us   +2.2%    0.98x  95.8% -> 93.7%   -2.1 pp  100* -> 256  bandwidth
-  stream.triad   opaque 33.55MF/201.33MB   1.233 ms   1.247 ms   +1.1%    0.99x  98.1% -> 97.1%   -1.1 pp          256  bandwidth
+  kernel         shape                     baseline  candidate  delta  speedup  verdict        eff a->b    d eff  tgroup a->b  bound
+  -------------  -----------------------  ---------  ---------  -----  -------  -------  --------------  -------  -----------  ---------
+  ffn.gemm       gemm 1024x1024x1024      674.14 us  672.64 us  -0.2%    1.00x  no call  92.4% -> 92.7%  +0.2 pp            -  compute
+  act.scale      elem n=16777216          866.91 us  892.36 us  +2.9%    0.97x  no call  93.0% -> 90.4%  -2.7 pp  100* -> 256  bandwidth
+  stream.triad   opaque 33.55MF/201.33MB   1.271 ms   1.283 ms  +0.9%    0.99x  no call  95.2% -> 94.3%  -0.9 pp          256  bandwidth
   ...
-  matched 6/6 kernels — total 5.427 ms -> 5.017 ms (-7.6%)
+  verdict compares those medians and is withheld ("no call") when the two
+  min-p95 spreads overlap: a gap narrower than the run-to-run noise that
+  produced it is not a result. `report` prints each side's spread.
+
+  matched 6/6 kernels — total 5.162 ms -> 5.203 ms (+0.8%)
+  1 moved beyond both spreads, 5 within noise (no call)
+  - act.scale: 866.3-884.3 us vs 871.0-896.5 us — medians differ by +2.9%, spreads overlap
   occupancy changes:
   - act.scale: 100 -> 256 threads/threadgroup (+15.2 pp of pipeline max), limiter executionWidthAlignment -> none
 ```
 
+**The `verdict` column is the point.** `act.scale`'s `+2.9%` would read as a
+regression caused by fixing its threadgroup; the two spreads overlap almost
+entirely, so the tool declines to say so. The `occupancy changes:` line needs no
+repeats at all, because a threadgroup size is a fact about shape rather than a
+stopwatch reading. `--repeats 1` restores single-run capture, and then every
+verdict is withheld rather than guessed.
+
 Kernels align by label + shape + precision; a kernel whose shape changed shows up
 as present in only one trace rather than being compared misleadingly. Occupancy
-is only compared when both sides have it — a v1 trace against a v2 one reports no
+is only compared when both sides have it — a v1 trace against a v3 one reports no
 delta rather than announcing a fix that never happened.
 
 Run `metalscope help` for the full flag list.
@@ -208,7 +237,7 @@ Run `metalscope help` for the full flag list.
 
 | target | what it is |
 | --- | --- |
-| `MetalscopeCore` | Trace schema, shape registry, roofline math, occupancy math, diff. No Metal needed. |
+| `MetalscopeCore` | Trace schema, shape registry, roofline math, occupancy math, repeat statistics, diff. No Metal needed. |
 | `MetalscopeCapture` | The opt-in capture API you link into your own app or benchmark, plus the per-counter-set resolvers. |
 | `metalscope` | The CLI. |
 
@@ -220,7 +249,7 @@ Run `metalscope help` for the full flag list.
 | [docs/WHITEPAPER.md](docs/WHITEPAPER.md) | the argument: motivation, related work, design rationale, evaluation with real numbers, limitations |
 | [docs/COMPARISON.md](docs/COMPARISON.md) | capability coverage vs. Nsight Compute, and the two-chip measured-vs-spec quantification |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | design, the timing ladder, why the peaks are measured, milestone status |
-| [docs/TRACE-FORMAT.md](docs/TRACE-FORMAT.md) | the JSON schema (v2), field by field |
+| [docs/TRACE-FORMAT.md](docs/TRACE-FORMAT.md) | the JSON schema (v3), field by field |
 | [docs/COUNTER-MATRIX.md](docs/COUNTER-MATRIX.md) | what each chip actually exposes, and how to add a row |
 
 ## License

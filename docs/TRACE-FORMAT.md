@@ -1,7 +1,7 @@
 # metalscope trace format
 
 One JSON schema, shared by capture (`MetalscopeCapture`), `metalscope report`,
-`metalscope diff`, and any future HTML output. Current `schemaVersion` is **2**.
+`metalscope diff`, and any future HTML output. Current `schemaVersion` is **3**.
 A reader must reject a trace whose `schemaVersion` is greater than the one it
 knows (`TraceIO.decode` does).
 
@@ -14,24 +14,26 @@ plain `diff` as well as with `metalscope diff`.
 | --- | --- |
 | 1 | initial: device, peaks, kernels with analytic FLOPs/bytes and the timing ladder |
 | 2 | added `kernels[].occupancy`, `kernels[].counters`, `device.maxThreadgroupMemoryBytes` |
+| 3 | added `kernels[].durationSamplesSeconds` — one per timed repeat |
 
-Every v2 addition is optional, so **v1 traces still read** — they simply carry no
-occupancy block, and `report`/`diff` drop their occupancy columns rather than
-inventing values. The reverse is not true: v1 readers reject v2 traces, which is
-the documented contract of the version field.
+Every addition since v1 is optional, so **v1 and v2 traces still read** — they
+simply carry no occupancy block and no repeat samples, and `report`/`diff` drop
+those columns rather than inventing values. The reverse is not true: an older
+reader rejects a newer trace, which is the documented contract of the version
+field.
 
 ## Top level
 
 ```jsonc
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "tool": "metalscope",
   "toolVersion": "0.1.0",
   "createdAt": "2026-08-26T19:06:18.512Z",   // ISO-8601, milliseconds
   "device": { ... },
   "peaks": { ... },                          // optional
   "kernels": [ ... ],
-  "notes": { "command": "bench", "variant": "baseline" }   // optional, free-form
+  "notes": { "command": "bench", "variant": "baseline", "repeats": "5" }  // optional, free-form
 }
 ```
 
@@ -85,8 +87,8 @@ for several GPUs.
   "label": "ffn.gemm",
   "shape": { "kind": "gemm", "m": 1024, "n": 1024, "k": 1024 },
   "precision": "fp32",             // fp32 | fp16 | bf16 | int8
-  "durationSeconds": 0.00092634,   // ONE invocation: measured span / iterations
-  "iterations": 162,               // invocations encoded into the region
+  "durationSeconds": 0.00067830,   // ONE invocation; the median when repeated
+  "iterations": 162,               // invocations encoded into ONE region
   "timingSource": "command-buffer",
   "flops": 2147483648,             // analytic, for one invocation
   "bytes": 12582912,               // analytic, for one invocation
@@ -98,6 +100,9 @@ for several GPUs.
   "counters": {                    // optional, v2 — absent on Apple silicon
     "stageutilization.TotalCycles": 184320
   },
+  "durationSamplesSeconds": [      // optional, v3 — one per timed repeat
+    0.00067303, 0.00068620, 0.00067830, 0.00067451, 0.00068102
+  ],
   "notes": { "backend": "MPSMatrixMultiplication" }   // optional
 }
 ```
@@ -107,6 +112,46 @@ the shape registry, and so `opaque` shapes survive a round trip.
 
 Note that `durationSeconds` is per invocation while `stages[]` durations are raw
 per-encoder spans, not divided by `iterations`.
+
+#### `durationSamplesSeconds` (v3)
+
+Per-invocation seconds for each *timed repeat*, in the order they ran. Present
+only when the region was captured more than once; a single-run capture omits the
+field entirely, because an array of one would read as a measured spread of zero.
+
+`iterations` describes one repeat, not the total: five repeats of 162 iterations
+is `"iterations": 162` and five samples, each already divided by 162.
+
+**Only the samples are stored.** `min`, `median`, `mean`, `p95`, `max` and the
+spread fraction are derived on read, for the same reason the occupancy ratios
+are: a trace that carried both could be edited or merged into a state where the
+summary and the samples disagree, and a reader would have no way to tell which
+half to believe. `metalscope report --json` emits the derived values under
+`runStatistics` so a consumer never has to re-implement the conventions — which
+matter, and are:
+
+- **median** is the *lower* of the two middle samples when the count is even, so
+  `durationSeconds` is always a run that actually happened rather than the
+  average of two that did.
+- **p95** is nearest-rank — index `ceil(0.95 n) - 1` — never interpolated. With
+  the default five repeats that makes p95 the slowest sample, which is the
+  honest reading of "95th percentile of five points".
+
+`durationSeconds` is the median of these samples, and every derived number in a
+report — GFLOP/s, bandwidth, efficiency, roofline placement — is computed from
+it. A wide spread is therefore a warning about the whole row, not just the
+duration column.
+
+The other per-region fields — `stages`, `counters`, `occupancy`,
+`hostDurationSeconds` — come from the single repeat whose duration is that
+median. Summing or averaging them across repeats would describe a run that never
+happened. `timingSource`, by contrast, is the *worst* tier any repeat reached: a
+duration is only as trustworthy as its weakest sample.
+
+Warm-up runs are not among the samples. A capture with `repeats > 1` runs one
+discarded region at the same iteration count first, so that every timed repeat
+sees an already-ramped GPU rather than the first one absorbing the clock ramp
+(§3.1 of the whitepaper, and the reason `calibrate` probes before it measures).
 
 #### `occupancy` (v2)
 
@@ -226,6 +271,32 @@ present in only one trace rather than being dropped. Change a kernel's shape and
 it will *not* align — that's deliberate, since the comparison would be
 meaningless.
 
+## Diff verdicts
+
+`diff` compares the two medians and adds a `verdict`, which is the one column
+that says whether the delta beside it means anything:
+
+| verdict | when |
+| --- | --- |
+| `faster` / `slower` | the two `[min, p95]` intervals are disjoint, and the candidate's median is the lower / higher one |
+| `within-noise` (shown as `no call`) | the intervals overlap — a gap narrower than the run-to-run noise that produced it is not a result |
+| `unmeasured` (shown as `-`) | one or both sides were captured once, so there is no spread to compare a delta against |
+
+The interval runs from `min` to `p95` rather than `min` to `max`, so a single
+scheduler hiccup does not widen it far enough to swallow every real result.
+Intervals that touch at a point count as overlapping: the rule exists to refuse
+marginal calls, so the boundary resolves toward refusing.
+
+`--json` carries `verdict`, `spreadsOverlap`, each side's repeat count, and each
+side's `min`/`p95`, plus the rule itself as `verdictRule` — a consumer reading a
+withheld verdict needs to know what withholding one means.
+
+This narrows the false-positive rate rather than abolishing it. Measured on an
+M1 Pro over all six pairings of four captures of an *unchanged* baseline at
+microsecond scale: single-run comparisons showed a >5% delta in 30 of 36
+kernel pairs, worst 132%; the same captures at five repeats produced a verdict
+at all in 4 of 36, worst median gap 7.2%.
+
 ## Writing traces from your own code
 
 ```swift
@@ -235,7 +306,8 @@ let session = try CaptureSession()
 try session.capture(label: "attn.sdpa",
                     shape: .attention(b: 1, h: 8, s: 512, d: 64),
                     precision: .fp16,
-                    iterations: 32) { region in
+                    iterations: 32,
+                    repeats: 5) { region in       // 5 timed runs + a warm-up
     for _ in 0..<32 {
         let encoder = try region.makeComputeCommandEncoder()   // stage-sampled
         encoder.setBuffer(...)
@@ -247,6 +319,13 @@ try session.capture(label: "attn.sdpa",
 }
 try session.writeTrace()      // honours $METALSCOPE_TRACE
 ```
+
+`repeats` runs the closure that many times over, each into its own command
+buffer, and appends **one** record holding every sample. It defaults to 1, so
+existing callers are unchanged and record no spread — and `diff` will then
+withhold every verdict rather than reading one point as a measurement.
+`warmupRuns:` overrides the discarded run (default: one when repeating, none
+when not) for callers whose workload is already warm.
 
 `region.dispatchThreads` / `region.dispatchThreadgroups` set the pipeline state,
 encode the dispatch, and record its static occupancy — so what the trace says was

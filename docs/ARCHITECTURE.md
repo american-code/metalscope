@@ -148,6 +148,13 @@ output — documented in [TRACE-FORMAT.md](TRACE-FORMAT.md). `diff` aligns kerne
 by label + shape + precision, reports duration delta, efficiency delta, and which
 resource bound (bandwidth vs. compute vs. ridge) each version sits on.
 
+Durations are medians over repeated captures, and the trace carries every sample
+(schema v3) so a reader can see the spread rather than guess at it. `diff`
+compares medians and **withholds a verdict when the two kernels' min-p95 spreads
+overlap**, stating the rule beside the table: on microsecond kernels a
+single-run delta is mostly the stopwatch, and a number the reader takes for a
+result is worse than no number.
+
 ## Milestones
 
 1. ✅ `info` + `calibrate` with measured GEMM/triad peaks.
@@ -159,13 +166,16 @@ resource bound (bandwidth vs. compute vs. ridge) each version sits on.
 5. 🟡 Static occupancy analysis, per-set counter resolvers, per-chip counter
    matrix — done. Occupancy/stall *counters* remain blocked on hardware that
    exposes them.
+6. ✅ Multi-run capture: `--repeats` with a discarded warm-up, per-kernel spread
+   in the trace (schema v3) and the report, and diff verdicts gated on spread
+   overlap.
 
 ### Milestone 5: what landed, and what is still blocked
 
 Done, and unblocked on this machine:
 
 - **Static occupancy analysis** — see [above](#static-occupancy). Recorded at
-  capture time, carried in schema v2, surfaced as `report` columns, a
+  capture time, carried since schema v2, surfaced as `report` columns, a
   `report --occupancy` detail block, a headroom hint, and a `diff` column.
 - **Per-set counter resolvers** — `CaptureSession` no longer hardcodes
   `timestamp`. All three of Apple's common sets have resolvers; the ones a device

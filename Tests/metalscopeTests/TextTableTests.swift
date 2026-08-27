@@ -250,6 +250,17 @@ final class TextTableTests: XCTestCase {
         XCTAssertEqual(Fmt.durationRange(0.4, 1.5), "0.400-1.500 s")
     }
 
+    /// Two spans printed together must share a unit, or "0.959-1.002 ms vs
+    /// 952.2-986.8 us" reads as two different numbers when it is one.
+    func testDurationRangeCanBorrowAnotherSpansUnit() {
+        XCTAssertEqual(Fmt.durationRange(0.000_952_2, 0.000_986_8), "952.2-986.8 us")
+        XCTAssertEqual(Fmt.durationRange(0.000_952_2, 0.000_986_8, unitBasis: 0.001_002),
+                       "0.952-0.987 ms")
+        // A nonsense basis falls back to the high end rather than to no output.
+        XCTAssertEqual(Fmt.durationRange(77e-6, 195e-6, unitBasis: 0), "77.0-195.0 us")
+        XCTAssertEqual(Fmt.durationRange(77e-6, 195e-6, unitBasis: .nan), "77.0-195.0 us")
+    }
+
     func testDurationRangeRefusesNonPositiveNaNOrInvertedBounds() {
         XCTAssertEqual(Fmt.durationRange(0, 1e-3), "-")
         XCTAssertEqual(Fmt.durationRange(1e-3, 0), "-")

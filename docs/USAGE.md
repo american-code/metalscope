@@ -173,11 +173,13 @@ path your own instrumented app would take — and writes a trace.
 $ metalscope bench --variant baseline --output baseline.json
 metalscope bench [baseline] — Apple M1 Pro
   timing: encoder stage timestamps + command-buffer GPU time
+  repeats: 5 timed runs per kernel, after a discarded warm-up run
   captured 6 kernels -> ~/work/baseline.json
 
 $ metalscope bench --variant tuned --output tuned.json
 metalscope bench [tuned] — Apple M1 Pro
   timing: encoder stage timestamps + command-buffer GPU time
+  repeats: 5 timed runs per kernel, after a discarded warm-up run
   captured 6 kernels -> ~/work/tuned.json
 ```
 
@@ -187,31 +189,42 @@ purpose** — not a multiple of the 32-wide SIMD group — and uses scalar loads
 `tuned` fixes both. Add `--report` to print the roofline table immediately after
 capture.
 
+Each kernel is timed **five times** (`--repeats`, default 5), preceded by one
+discarded warm-up run at the same iteration count so no timed sample pays the
+GPU's clock ramp. All five samples go into the trace; `report` shows the median
+and its spread, and `diff` uses the two spreads to decide whether a delta means
+anything. `--repeats 1` restores single-run capture, records no spread, and
+makes `diff` withhold every verdict — see
+[trusting a delta](#trusting-a-delta).
+
 ### `metalscope report` — the roofline table
 
 ```
 $ metalscope report baseline.json
 roofline report — ~/work/baseline.json
-  device:  Apple M1 Pro   captured 2026-08-26T22:37:04Z
+  device:  Apple M1 Pro   captured 2026-08-27T19:39:08Z
   peaks:   3.45 TF fp32 / 3.33 TF fp16 / 166.4 GB/s  [measured]
   ridge:   20.7 FLOP/byte (fp32), 20.0 FLOP/byte (fp16)
+  repeats: 5 timed runs per kernel
 
-  kernel         shape                    prec  time/iter   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
-  -------------  -----------------------  ----  ---------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
-  ffn.gemm       gemm 1024x1024x1024      fp32  942.17 us   2.28 TF   13.4   171  compute     3.45 TF  66.1%       -      -  cmdbuf
-  ffn.gemm.half  gemm 1024x1024x1024      fp16  701.79 us   3.06 TF    9.0   341  compute     3.33 TF  91.8%       -      -  cmdbuf
-  attn.sdpa      attn b1 h8 s512 d64      fp32  764.29 us  702.4 GF    5.5   128  compute     3.45 TF  20.4%       -      -  cmdbuf
-  block.rmsnorm  norm n=16777216          fp32  903.71 us   92.8 GF  148.5  0.62  bandwidth  104.0 GF  89.3%     256  25.0%  counters
-  act.scale      elem n=16777216          fp32  900.11 us   18.6 GF  149.1  0.12  bandwidth   20.8 GF  89.6%    100*   9.8%  counters
-  stream.triad   opaque 33.55MF/201.33MB  fp32   1.343 ms   25.0 GF  149.9  0.17  bandwidth   27.7 GF  90.1%     256  25.0%  counters
+  kernel         shape                    prec  time/iter          spread   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
+  -------------  -----------------------  ----  ---------  --------------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
+  ffn.gemm       gemm 1024x1024x1024      fp32  674.14 us  668.7-680.4 us   3.19 TF   18.7   171  compute     3.45 TF  92.4%       -      -  cmdbuf
+  ffn.gemm.half  gemm 1024x1024x1024      fp16  706.90 us  701.1-715.4 us   3.04 TF    8.9   341  compute     3.33 TF  91.2%       -      -  cmdbuf
+  attn.sdpa      attn b1 h8 s512 d64      fp32  749.20 us  745.5-751.7 us  716.6 GF    5.6   128  compute     3.45 TF  20.8%       -      -  cmdbuf
+  block.rmsnorm  norm n=16777216          fp32  894.00 us  877.5-912.4 us   93.8 GF  150.1  0.62  bandwidth  104.0 GF  90.2%     256  25.0%  counters
+  act.scale      elem n=16777216          fp32  866.91 us  866.3-884.3 us   19.4 GF  154.8  0.12  bandwidth   20.8 GF  93.0%    100*   9.8%  counters
+  stream.triad   opaque 33.55MF/201.33MB  fp32   1.271 ms  1.266-1.307 ms   26.4 GF  158.4  0.17  bandwidth   27.7 GF  95.2%     256  25.0%  counters
 
   AI = analytic FLOPs / compulsory bytes. eff = achieved / roofline ceiling at that AI.
+  time/iter is the median of the timed repeats; spread is min to nearest-rank p95 over the same runs.
+  every other column is computed from the median, so a wide spread is a warning about all of them.
   tgroup = threads/threadgroup (* = not a multiple of the SIMD width). occ = that vs the pipeline's max.
   a dash means metalscope never saw the pipeline (MPS and friends encode their own dispatches).
 
   headroom:
-  - attn.sdpa is compute-bound at 20.4% of the compute ceiling (unfused: s x s scores round-trip through DRAM)
-  - act.scale: threadgroup of 100 is not a multiple of the 32-wide SIMD group — 28 of 128 lanes idle in every threadgroup (78.1% lane use); round to 96 or 128
+  - attn.sdpa is compute-bound at 20.8% of the compute ceiling (unfused: s x s scores round-trip through DRAM)
+  - act.scale: threadgroup of 100 is not a multiple of the 32-wide SIMD group — 28 of 128 lanes idle in every threadgroup (78.1% lane use); round to 96 or 128; note it is already at 93.0% of its bandwidth ceiling, so this costs lanes, not time
 ```
 
 ### `metalscope diff` — what moved
@@ -223,25 +236,44 @@ diff — baseline baseline.json  ->  candidate tuned.json
   peaks:   3.45 TF fp32 / 166.4 GB/s  [measured]
   variant: baseline -> tuned
 
-  kernel         shape                     baseline  candidate   delta  speedup        eff a->b     d eff  tgroup a->b  bound
-  -------------  -----------------------  ---------  ---------  ------  -------  --------------  --------  -----------  ---------
-  ffn.gemm       gemm 1024x1024x1024      942.17 us  660.85 us  -29.9%    1.43x  66.1% -> 94.3%  +28.2 pp            -  compute
-  ffn.gemm.half  gemm 1024x1024x1024      701.79 us  697.11 us   -0.7%    1.01x  91.8% -> 92.4%   +0.6 pp            -  compute
-  attn.sdpa      attn b1 h8 s512 d64      764.29 us  770.00 us   +0.7%    0.99x  20.4% -> 20.2%   -0.2 pp            -  compute
-  block.rmsnorm  norm n=16777216          903.71 us  926.62 us   +2.5%    0.98x  89.3% -> 87.0%   -2.2 pp          256  bandwidth
-  act.scale      elem n=16777216          900.11 us  886.79 us   -1.5%    1.02x  89.6% -> 91.0%   +1.3 pp  100* -> 256  bandwidth
-  stream.triad   opaque 33.55MF/201.33MB   1.343 ms   1.305 ms   -2.8%    1.03x  90.1% -> 92.7%   +2.6 pp          256  bandwidth
+  kernel         shape                     baseline  candidate  delta  speedup  verdict        eff a->b    d eff  tgroup a->b  bound
+  -------------  -----------------------  ---------  ---------  -----  -------  -------  --------------  -------  -----------  ---------
+  ffn.gemm       gemm 1024x1024x1024      674.14 us  672.64 us  -0.2%    1.00x  no call  92.4% -> 92.7%  +0.2 pp            -  compute
+  ffn.gemm.half  gemm 1024x1024x1024      706.90 us  710.18 us  +0.5%    1.00x  no call  91.2% -> 90.7%  -0.4 pp            -  compute
+  attn.sdpa      attn b1 h8 s512 d64      749.20 us  759.34 us  +1.4%    0.99x  slower   20.8% -> 20.5%  -0.3 pp            -  compute
+  block.rmsnorm  norm n=16777216          894.00 us  885.36 us  -1.0%    1.01x  no call  90.2% -> 91.1%  +0.9 pp          256  bandwidth
+  act.scale      elem n=16777216          866.91 us  892.36 us  +2.9%    0.97x  no call  93.0% -> 90.4%  -2.7 pp  100* -> 256  bandwidth
+  stream.triad   opaque 33.55MF/201.33MB   1.271 ms   1.283 ms  +0.9%    0.99x  no call  95.2% -> 94.3%  -0.9 pp          256  bandwidth
 
-  matched 6/6 kernels — total 5.555 ms -> 5.246 ms (-5.6%)
+  baseline/candidate are medians over the timed repeats.
+  verdict compares those medians and is withheld ("no call") when the two
+  min-p95 spreads overlap: a gap narrower than the run-to-run noise that
+  produced it is not a result. `report` prints each side's spread.
+
+  matched 6/6 kernels — total 5.162 ms -> 5.203 ms (+0.8%)
+  1 moved beyond both spreads, 5 within noise (no call)
+  - ffn.gemm: 668.7-680.4 us vs 666.9-676.4 us — medians differ by -0.2%, spreads overlap
+  - ffn.gemm.half: 701.1-715.4 us vs 708.9-712.8 us — medians differ by +0.5%, spreads overlap
+  - block.rmsnorm: 877.5-912.4 us vs 869.9-921.8 us — medians differ by -1.0%, spreads overlap
+  - act.scale: 866.3-884.3 us vs 871.0-896.5 us — medians differ by +2.9%, spreads overlap
+  - stream.triad: 1.266-1.307 ms vs 1.274-1.285 ms — medians differ by +0.9%, spreads overlap
   occupancy changes:
   - act.scale: 100 -> 256 threads/threadgroup (+15.2 pp of pipeline max), limiter executionWidthAlignment -> none
 ```
 
-Note what the fp32 GEMM did: it moved from 66.1% to 94.3% of the measured compute
-ceiling without any change to the kernel. That is MPS taking a different path for
-the same shape between runs, and it is the single best argument for reading the
-occupancy column rather than trusting one timing delta. See
-[run-to-run variance](#calibration-varies-run-to-run).
+Read the `verdict` column before the `delta` column. Five of the six deltas here
+are inside the noise that produced them, and the tool says so instead of letting
+you read `+2.9%` on `act.scale` as a regression. The sixth is worth dwelling on:
+`attn.sdpa` is called `slower` on a 1.4% gap, and *nothing in that kernel
+changed between the two variants*. Two five-sample intervals can land disjoint
+by luck; the rule cuts these down (see [trusting a delta](#trusting-a-delta) for
+the measured rate) but cannot remove them. A 1.4% verdict on an untouched kernel
+is a prompt to re-run, not a finding.
+
+The `occupancy changes:` section is the part of a diff that a single pair of runs
+can support, because it reports a change in shape rather than a stopwatch
+reading: `act.scale` really did go from a ragged 100-thread threadgroup to 256,
+and that fact does not have a spread.
 
 ---
 
@@ -268,7 +300,8 @@ occupancy column rather than trusting one timing delta. See
 | `kernel` | the `label` you passed to `capture` | the identity used to align traces in `diff` |
 | `shape` | the annotated kernel shape | `gemm MxNxK`, `attn bB hH sS dD`, `elem n=N`, `norm n=N`, `opaque <flops>F/<bytes>B` |
 | `prec` | element precision | picks the byte size for the analytic model *and* which compute ceiling to score against (`fp16`/`bf16`/`int8` use the half peak) |
-| `time/iter` | seconds for **one** invocation | the measured region span divided by `iterations` — not the whole region |
+| `time/iter` | seconds for **one** invocation | the measured region span divided by `iterations` — not the whole region. With `--repeats N` it is the **median** of the N samples |
+| `spread` | `min` to nearest-rank `p95` over the timed repeats | the width of that median's noise band. Present only when the trace was repeated; every other column is computed from the median, so a wide spread discounts the whole row |
 | `GFLOP/s` | analytic FLOPs ÷ `time/iter` | what the kernel achieved, given the shape's FLOP count |
 | `GB/s` | analytic compulsory bytes ÷ `time/iter` | what the kernel achieved against the *compulsory* traffic model, not measured DRAM traffic |
 | `AI` | arithmetic intensity, FLOPs per byte | the x-axis of the roofline. Computed from the shape, so it is exact for the model and independent of how fast the kernel ran |
@@ -317,14 +350,14 @@ result.
 ```
 $ metalscope report baseline.json --sort efficiency
 ...
-  kernel         shape                    prec  time/iter   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
-  -------------  -----------------------  ----  ---------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
-  attn.sdpa      attn b1 h8 s512 d64      fp32  764.29 us  702.4 GF    5.5   128  compute     3.45 TF  20.4%       -      -  cmdbuf
-  ffn.gemm       gemm 1024x1024x1024      fp32  942.17 us   2.28 TF   13.4   171  compute     3.45 TF  66.1%       -      -  cmdbuf
-  block.rmsnorm  norm n=16777216          fp32  903.71 us   92.8 GF  148.5  0.62  bandwidth  104.0 GF  89.3%     256  25.0%  counters
-  act.scale      elem n=16777216          fp32  900.11 us   18.6 GF  149.1  0.12  bandwidth   20.8 GF  89.6%    100*   9.8%  counters
-  stream.triad   opaque 33.55MF/201.33MB  fp32   1.343 ms   25.0 GF  149.9  0.17  bandwidth   27.7 GF  90.1%     256  25.0%  counters
-  ffn.gemm.half  gemm 1024x1024x1024      fp16  701.79 us   3.06 TF    9.0   341  compute     3.33 TF  91.8%       -      -  cmdbuf
+  kernel         shape                    prec  time/iter          spread   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
+  -------------  -----------------------  ----  ---------  --------------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
+  attn.sdpa      attn b1 h8 s512 d64      fp32  749.20 us  745.5-751.7 us  716.6 GF    5.6   128  compute     3.45 TF  20.8%       -      -  cmdbuf
+  block.rmsnorm  norm n=16777216          fp32  894.00 us  877.5-912.4 us   93.8 GF  150.1  0.62  bandwidth  104.0 GF  90.2%     256  25.0%  counters
+  ffn.gemm.half  gemm 1024x1024x1024      fp16  706.90 us  701.1-715.4 us   3.04 TF    8.9   341  compute     3.33 TF  91.2%       -      -  cmdbuf
+  ffn.gemm       gemm 1024x1024x1024      fp32  674.14 us  668.7-680.4 us   3.19 TF   18.7   171  compute     3.45 TF  92.4%       -      -  cmdbuf
+  act.scale      elem n=16777216          fp32  866.91 us  866.3-884.3 us   19.4 GF  154.8  0.12  bandwidth   20.8 GF  93.0%    100*   9.8%  counters
+  stream.triad   opaque 33.55MF/201.33MB  fp32   1.271 ms  1.266-1.307 ms   26.4 GF  158.4  0.17  bandwidth   27.7 GF  95.2%     256  25.0%  counters
 ```
 
 `--sort efficiency` is worst-first, because that is the list you actually work
@@ -340,16 +373,23 @@ never re-implements the arithmetic:
 $ metalscope report baseline.json --json
 ...
     {
-      "achievedBandwidthGBs" : 149.11206584898392,
-      "achievedGFLOPS" : 18.63900823112299,
+      "achievedBandwidthGBs" : 154.8225031882795,
+      "achievedGFLOPS" : 19.35281289853494,
       "arithmeticIntensity" : 0.125,
       "bound" : "bandwidth",
       "ceilingGFLOPS" : 20.800587006346348,
-      "durationSeconds" : 0.0009001131279069767,
-      "efficiency" : 0.896080876248163,
+      "durationSamplesSeconds" : [
+        0.0008669135638297873,
+        0.0008727613031914893,
+        0.0008662918882978723,
+        0.0008667663989361702,
+        0.0008842637393617021
+      ],
+      "durationSeconds" : 0.0008669135638297873,
+      "efficiency" : 0.930397439871784,
       "label" : "act.scale",
       "occupancy" : {
-        "dispatchCount" : 172,
+        "dispatchCount" : 188,
         "executionWidthAligned" : false,
         "hint" : "threadgroup of 100 is not a multiple of the 32-wide SIMD group — 28 of 128 lanes idle in every threadgroup (78.1% lane use); round to 96 or 128",
         "idleLanesPerThreadgroup" : 28,
@@ -366,16 +406,29 @@ $ metalscope report baseline.json --json
         "variantCount" : 1
       },
       "precision" : "fp32",
+      "runStatistics" : {
+        "count" : 5,
+        "max" : 0.0008842637393617021,
+        "mean" : 0.0008713993787234043,
+        "median" : 0.0008669135638297873,
+        "min" : 0.0008662918882978723,
+        "p95" : 0.0008842637393617021,
+        "spreadFraction" : 0.02073084539643736
+      },
       "shape" : "elem n=16777216",
       "timingSource" : "counter-sample-buffer"
     },
 ```
 
-The trace on disk stores only the raw inputs (`threadsPerThreadgroup`,
+The trace on disk stores only the raw inputs — `threadsPerThreadgroup`,
 `maxTotalThreadsPerThreadgroup`, `threadExecutionWidth`,
-`threadgroupMemoryBytes`, …). Every ratio above is derived when the trace is
-read, so a trace can never disagree with itself. See
-[TRACE-FORMAT.md](TRACE-FORMAT.md).
+`threadgroupMemoryBytes`, and the five `durationSamplesSeconds`. Every ratio
+above, and the whole `runStatistics` block, is derived when the trace is read,
+so a trace can never disagree with itself. Note that `durationSeconds` is
+exactly `runStatistics.median`, which is exactly one of the five samples: the
+median is the *lower* of the two middle values on an even count, and p95 is
+nearest-rank, so both are runs that happened rather than arithmetic between two
+that did. See [TRACE-FORMAT.md](TRACE-FORMAT.md).
 
 ---
 
@@ -462,35 +515,40 @@ to see what you would have been told:
 ```
 $ metalscope report baseline.json --spec-peaks
 roofline report — ~/work/baseline.json
-  device:  Apple M1 Pro   captured 2026-08-26T22:37:04Z
+  device:  Apple M1 Pro   captured 2026-08-27T19:39:08Z
   peaks:   5.20 TF fp32 / 10.40 TF fp16 / 200.0 GB/s  [spec-sheet folklore]
   ridge:   26.0 FLOP/byte (fp32), 52.0 FLOP/byte (fp16)
+  repeats: 5 timed runs per kernel
 
-  kernel         shape                    prec  time/iter   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
-  -------------  -----------------------  ----  ---------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
-  ffn.gemm       gemm 1024x1024x1024      fp32  942.17 us   2.28 TF   13.4   171  compute     5.20 TF  43.8%       -      -  cmdbuf
-  ffn.gemm.half  gemm 1024x1024x1024      fp16  701.79 us   3.06 TF    9.0   341  compute    10.40 TF  29.4%       -      -  cmdbuf
-  attn.sdpa      attn b1 h8 s512 d64      fp32  764.29 us  702.4 GF    5.5   128  compute     5.20 TF  13.5%       -      -  cmdbuf
-  block.rmsnorm  norm n=16777216          fp32  903.71 us   92.8 GF  148.5  0.62  bandwidth  125.0 GF  74.3%     256  25.0%  counters
-  act.scale      elem n=16777216          fp32  900.11 us   18.6 GF  149.1  0.12  bandwidth   25.0 GF  74.6%    100*   9.8%  counters
-  stream.triad   opaque 33.55MF/201.33MB  fp32   1.343 ms   25.0 GF  149.9  0.17  bandwidth   33.3 GF  75.0%     256  25.0%  counters
+  kernel         shape                    prec  time/iter          spread   GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
+  -------------  -----------------------  ----  ---------  --------------  --------  -----  ----  ---------  --------  -----  ------  -----  --------
+  ffn.gemm       gemm 1024x1024x1024      fp32  674.14 us  668.7-680.4 us   3.19 TF   18.7   171  compute     5.20 TF  61.3%       -      -  cmdbuf
+  ffn.gemm.half  gemm 1024x1024x1024      fp16  706.90 us  701.1-715.4 us   3.04 TF    8.9   341  compute    10.40 TF  29.2%       -      -  cmdbuf
+  attn.sdpa      attn b1 h8 s512 d64      fp32  749.20 us  745.5-751.7 us  716.6 GF    5.6   128  compute     5.20 TF  13.8%       -      -  cmdbuf
+  block.rmsnorm  norm n=16777216          fp32  894.00 us  877.5-912.4 us   93.8 GF  150.1  0.62  bandwidth  125.0 GF  75.1%     256  25.0%  counters
+  act.scale      elem n=16777216          fp32  866.91 us  866.3-884.3 us   19.4 GF  154.8  0.12  bandwidth   25.0 GF  77.4%    100*   9.8%  counters
+  stream.triad   opaque 33.55MF/201.33MB  fp32   1.271 ms  1.266-1.307 ms   26.4 GF  158.4  0.17  bandwidth   33.3 GF  79.2%     256  25.0%  counters
 
   AI = analytic FLOPs / compulsory bytes. eff = achieved / roofline ceiling at that AI.
+  time/iter is the median of the timed repeats; spread is min to nearest-rank p95 over the same runs.
+  every other column is computed from the median, so a wide spread is a warning about all of them.
   tgroup = threads/threadgroup (* = not a multiple of the SIMD width). occ = that vs the pipeline's max.
   a dash means metalscope never saw the pipeline (MPS and friends encode their own dispatches).
   peaks are spec-sheet folklore — run `metalscope calibrate` before trusting eff%.
 
   headroom:
-  - ffn.gemm.half is compute-bound at 29.4% of the compute ceiling
-  - attn.sdpa is compute-bound at 13.5% of the compute ceiling (unfused: s x s scores round-trip through DRAM)
+  - ffn.gemm.half is compute-bound at 29.2% of the compute ceiling
+  - attn.sdpa is compute-bound at 13.8% of the compute ceiling (unfused: s x s scores round-trip through DRAM)
   - act.scale: threadgroup of 100 is not a multiple of the 32-wide SIMD group — 28 of 128 lanes idle in every threadgroup (78.1% lane use); round to 96 or 128
 ```
 
-Compare the two `ffn.gemm.half` rows. Against measured peaks it is at **91.8%**
-and there is nothing to win. Against folklore it is at **29.4%** and appears in
+Compare the two `ffn.gemm.half` rows. Against measured peaks it is at **91.2%**
+and there is nothing to win. Against folklore it is at **29.2%** and appears in
 the headroom list as the second-worst kernel in the trace. Same trace, same
-kernel, same microseconds — one of those two readings sends you off to spend a
-week rewriting a GEMM that is already essentially optimal.
+kernel, same microseconds — and the `spread` column says those microseconds are
+pinned to within 2%, so the disagreement is entirely in the denominator. One of
+those two readings sends you off to spend a week rewriting a GEMM that is
+already essentially optimal.
 
 > **Strictness.** `--peaks-file` never falls back. A file that cannot be read,
 > cannot be parsed, has no entry for the trace's device, or holds a non-measured
@@ -509,9 +567,10 @@ the Nth in the candidate).
 
 | column | how to read it |
 | --- | --- |
-| `baseline` / `candidate` | per-iteration duration on each side, or `absent` |
+| `baseline` / `candidate` | per-iteration duration on each side, or `absent`. The **median** when that side was repeated |
 | `delta` | signed relative change. Negative is faster |
 | `speedup` | baseline ÷ candidate. Above 1.00x is faster |
+| `verdict` | whether that delta survives the two sides' noise: `faster`, `slower`, `no call`, or `-` when a side was captured once. Present only when at least one side was repeated |
 | `eff a->b` | roofline efficiency on each side |
 | `d eff` | efficiency change in percentage **points**, not percent |
 | `tgroup a->b` | threads per threadgroup, or a single value when unchanged. `-` on a side means no occupancy data there |
@@ -524,54 +583,74 @@ side as unchanged, which would announce a fix that never happened:
 ```
 $ metalscope diff legacy-v1.json tuned.json
 ...
-  block.rmsnorm  norm n=16777216          903.71 us  926.62 us   +2.5%    0.98x  89.3% -> 87.0%   -2.2 pp     - -> 256  bandwidth
-  act.scale      elem n=16777216          900.11 us  886.79 us   -1.5%    1.02x  89.6% -> 91.0%   +1.3 pp     - -> 256  bandwidth
-  stream.triad   opaque 33.55MF/201.33MB   1.343 ms   1.305 ms   -2.8%    1.03x  90.1% -> 92.7%   +2.6 pp     - -> 256  bandwidth
-
-  matched 6/6 kernels — total 5.555 ms -> 5.246 ms (-5.6%)
+  block.rmsnorm  norm n=16777216          894.00 us  885.36 us  -1.0%    1.01x  -        90.2% -> 91.1%  +0.9 pp     - -> 256  bandwidth
+  act.scale      elem n=16777216          866.91 us  892.36 us  +2.9%    0.97x  -        93.0% -> 90.4%  -2.7 pp     - -> 256  bandwidth
+  stream.triad   opaque 33.55MF/201.33MB   1.271 ms   1.283 ms  +0.9%    0.99x  -        95.2% -> 94.3%  -0.9 pp     - -> 256  bandwidth
+...
+  matched 6/6 kernels — total 5.162 ms -> 5.203 ms (+0.8%)
+  0 moved beyond both spreads, 0 within noise (no call), 6 with no spread on one side
 ```
 
 There is no `occupancy changes:` section, because nothing can be known to have
-changed. Reporting a v1 trace at all drops the occupancy columns entirely rather
-than filling them with dashes:
+changed. The same applies to the verdict: a v1 trace was captured once, so every
+`verdict` is `-` and the summary counts all six as having no spread on one side.
+Reporting a v1 trace at all drops the occupancy and spread columns entirely
+rather than filling them with dashes:
 
 ```
 $ metalscope report legacy-v1.json
 ...
   kernel         shape                    prec  time/iter   GFLOP/s   GB/s    AI  bound       ceiling    eff  timing
   -------------  -----------------------  ----  ---------  --------  -----  ----  ---------  --------  -----  --------
-  ffn.gemm       gemm 1024x1024x1024      fp32  942.17 us   2.28 TF   13.4   171  compute     3.45 TF  66.1%  cmdbuf
-  ffn.gemm.half  gemm 1024x1024x1024      fp16  701.79 us   3.06 TF    9.0   341  compute     3.33 TF  91.8%  cmdbuf
+  ffn.gemm       gemm 1024x1024x1024      fp32  674.14 us   3.19 TF   18.7   171  compute     3.45 TF  92.4%  cmdbuf
+  ffn.gemm.half  gemm 1024x1024x1024      fp16  706.90 us   3.04 TF    8.9   341  compute     3.33 TF  91.2%  cmdbuf
   ...
 ```
 
-`diff --json` emits every field, including both sides' occupancy limiters:
+`diff --json` emits every field, including both sides' occupancy limiters, both
+sides' measurement intervals, and the verdict:
 
 ```
 $ metalscope diff baseline.json tuned.json --json
 ...
 {
   "baselineBound": "bandwidth",
-  "baselineEfficiency": 0.896080876248163,
+  "baselineEfficiency": 0.930397439871784,
+  "baselineMinSeconds": 0.0008662918882978723,
   "baselineOccupancyLimiter": "executionWidthAlignment",
-  "baselineSeconds": 0.0009001131279069767,
+  "baselineP95Seconds": 0.0008842637393617021,
+  "baselineRepeats": 5,
+  "baselineSeconds": 0.0008669135638297873,
   "baselineThreadgroupOccupancy": 0.09765625,
   "baselineThreadsPerThreadgroup": 100,
   "candidateBound": "bandwidth",
-  "candidateEfficiency": 0.9095411821658385,
+  "candidateEfficiency": 0.9038655892410075,
+  "candidateMinSeconds": 0.0008710042989130434,
   "candidateOccupancyLimiter": "none",
-  "candidateSeconds": 0.000886792347826087,
+  "candidateP95Seconds": 0.0008964698804347826,
+  "candidateRepeats": 5,
+  "candidateSeconds": 0.0008923607336956522,
   "candidateThreadgroupOccupancy": 0.25,
   "candidateThreadsPerThreadgroup": 256,
-  "durationDeltaFraction": -0.014799006555836318,
-  "efficiencyDeltaPoints": 1.3460305917675441,
+  "durationDeltaFraction": 0.029353756738383783,
+  "efficiencyDeltaPoints": -2.6531850630776566,
   "label": "act.scale",
   "occupancyDeltaPoints": 15.234375,
   "precision": "fp32",
   "shape": "elem n=16777216",
-  "speedup": 1.0150213069762553,
-  "status": "matched"
+  "speedup": 0.9714833150933512,
+  "spreadsOverlap": true,
+  "status": "matched",
+  "verdict": "within-noise"
 }
+```
+
+`verdict` is one of `faster`, `slower`, `within-noise`, or `unmeasured`. The
+top-level payload also carries the rule itself, so a consumer that sees a
+withheld verdict knows what the withholding means:
+
+```
+  "verdictRule": "verdict compares medians and is withheld (\"no call\") when the two min-p95 spreads overlap: a gap narrower than the run-to-run noise that produced it is not a result.",
 ```
 
 Diffing traces from two different devices prints a warning to stderr and
@@ -726,6 +805,10 @@ let weights = buffer(model * model * 3)
 let blockIterations = 32
 let elementIterations = 2048
 
+// Five timed runs per region, each preceded by one discarded warm-up run, so a
+// diff of two of these traces can tell a real change from the stopwatch.
+let blockRepeats = 5
+
 // 2 timestamps per encoder: 2048 sampled encoders needs a 4096-sample buffer,
 // which is exactly the 32 KB Metal allows on this chip. Leave this at its
 // default and the region silently (and correctly) falls back to command-buffer
@@ -737,7 +820,8 @@ session.maxSamplesPerRegion = 4096
 try session.capture(label: "block.rmsnorm",
                     shape: .norm(n: elements),
                     precision: .fp32,
-                    iterations: elementIterations) { region in
+                    iterations: elementIterations,
+                    repeats: blockRepeats) { region in
     var width = UInt32(model)
     for _ in 0..<elementIterations {
         let encoder = try region.makeComputeCommandEncoder(label: "rmsnorm")
@@ -768,6 +852,7 @@ try session.capture(label: "block.qkv",
                     shape: .gemm(m: rows, n: model * 3, k: model),
                     precision: .fp32,
                     iterations: blockIterations,
+                    repeats: blockRepeats,
                     notes: ["backend": "MPSMatrixMultiplication"]) { region in
     let x = MPSMatrix(buffer: normed, descriptor: xDesc)
     let w = MPSMatrix(buffer: weights, descriptor: wDesc)
@@ -804,6 +889,7 @@ try session.capture(label: "block.attention",
                     shape: .attention(b: 1, h: heads, s: seq, d: headDim),
                     precision: .fp32,
                     iterations: blockIterations,
+                    repeats: blockRepeats,
                     notes: ["fusion": "unfused: s x s scores round-trip through DRAM"]) { region in
     for _ in 0..<blockIterations {
         for head in 0..<heads {
@@ -824,7 +910,8 @@ try session.capture(label: "block.attention",
 try session.capture(label: "block.gelu",
                     shape: .elementwise(n: elements),
                     precision: .fp32,
-                    iterations: elementIterations) { region in
+                    iterations: elementIterations,
+                    repeats: blockRepeats) { region in
     for _ in 0..<elementIterations {
         let encoder = try region.makeComputeCommandEncoder(label: "gelu")
         encoder.setBuffer(activated, offset: 0, index: 0)
@@ -854,18 +941,21 @@ metalscope profile — running ~/src/block-bench/.build/release/block-bench 2048
   METALSCOPE_TRACE=~/work/block-32.json
 
 roofline report — ~/work/block-32.json
-  device:  Apple M1 Pro   captured 2026-08-26T22:42:34Z
+  device:  Apple M1 Pro   captured 2026-08-27T19:43:40Z
   peaks:   3.45 TF fp32 / 3.33 TF fp16 / 166.4 GB/s  [measured]
   ridge:   20.7 FLOP/byte (fp32), 20.0 FLOP/byte (fp16)
+  repeats: 5 timed runs per kernel
 
-  kernel           shape                 prec  time/iter  GFLOP/s   GB/s    AI  bound       ceiling     eff  tgroup    occ  timing
-  ---------------  --------------------  ----  ---------  -------  -----  ----  ---------  --------  ------  ------  -----  --------
-  block.rmsnorm    norm n=1048576        fp32   80.50 us  65.1 GF  104.2  0.62  bandwidth  104.0 GF   62.6%      32   3.1%  counters
-  block.qkv        gemm 2048x1536x512    fp32  956.18 us  3.37 TF   20.8   162  compute     3.45 TF   97.8%       -      -  cmdbuf
-  block.attention  attn b1 h8 s2048 d64  fp32   5.690 ms  1.51 TF    2.9   512  compute     3.45 TF   43.8%       -      -  cmdbuf
-  block.gelu       elem n=1048576        fp32   49.99 us  21.0 GF  167.8  0.12  bandwidth   20.8 GF  100.8%     256  25.0%  counters
+  kernel           shape                 prec  time/iter          spread  GFLOP/s   GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
+  ---------------  --------------------  ----  ---------  --------------  -------  -----  ----  ---------  --------  -----  ------  -----  --------
+  block.rmsnorm    norm n=1048576        fp32   77.98 us    72.9-91.6 us  67.2 GF  107.6  0.62  bandwidth  104.0 GF  64.6%      32   3.1%  counters
+  block.qkv        gemm 2048x1536x512    fp32  982.12 us  0.959-1.002 ms  3.28 TF   20.3   162  compute     3.45 TF  95.2%       -      -  cmdbuf
+  block.attention  attn b1 h8 s2048 d64  fp32   6.086 ms  5.995-6.127 ms  1.41 TF    2.8   512  compute     3.45 TF  41.0%       -      -  cmdbuf
+  block.gelu       elem n=1048576        fp32   54.10 us    52.5-57.1 us  19.4 GF  155.1  0.12  bandwidth   20.8 GF  93.2%     256  25.0%  counters
 
   AI = analytic FLOPs / compulsory bytes. eff = achieved / roofline ceiling at that AI.
+  time/iter is the median of the timed repeats; spread is min to nearest-rank p95 over the same runs.
+  every other column is computed from the median, so a wide spread is a warning about all of them.
   tgroup = threads/threadgroup (* = not a multiple of the SIMD width). occ = that vs the pipeline's max.
   a dash means metalscope never saw the pipeline (MPS and friends encode their own dispatches).
 
@@ -881,16 +971,23 @@ collect the trace without printing.
 Four kernels, four different stories, and every one of them is a thing
 Instruments cannot tell you:
 
-- **`block.qkv` at 97.8%** — MPS's GEMM is essentially at the measured compute
+- **`block.qkv` at 95.2%** — MPS's GEMM is essentially at the measured compute
   ceiling for this shape. There is nothing here. Move on.
-- **`block.gelu` at 100.8%** — above the ceiling, which is a *result*, not a bug;
-  see [§8](#efficiency-over-100).
-- **`block.attention` at 43.8%** — compute-bound, but less than half the ceiling,
+- **`block.gelu` at 93.2%** — a hair off the bandwidth roof; on other runs this
+  same kernel reads above 100%, which is a *result*, not a bug — see
+  [§8](#efficiency-over-100).
+- **`block.attention` at 41.0%** — compute-bound, but less than half the ceiling,
   and the `fusion` note says why: the `.attention` shape models a fused kernel
   where the s×s scores never reach DRAM, and this implementation spills them.
   That gap is the price of not fusing, quantified.
-- **`block.rmsnorm` at 62.6%** with a `tinyThreadgroup` limiter — the one
+- **`block.rmsnorm` at 64.6%** with a `tinyThreadgroup` limiter — the one
   structural finding, and the only line the headroom section bothered to print.
+
+Read the `spread` column alongside them. `block.rmsnorm` is 72.9–91.6 µs, a band
+±12% wide around its 78.0 µs median, so its 64.6% efficiency is really "about
+two thirds" — while `block.attention`, at 5.995–6.127 ms, is pinned down to
+about 1%. Both numbers are in the same table and only one of them is worth three
+significant figures.
 
 ### 7.3 Fixing what it found, and proving it
 
@@ -904,23 +1001,40 @@ diff — baseline block-32.json  ->  candidate block-256.json
   device:  Apple M1 Pro
   peaks:   3.45 TF fp32 / 166.4 GB/s  [measured]
 
-  kernel           shape                  baseline  candidate   delta  speedup         eff a->b     d eff  tgroup a->b  bound
-  ---------------  --------------------  ---------  ---------  ------  -------  ---------------  --------  -----------  ---------
-  block.rmsnorm    norm n=1048576         80.50 us   64.38 us  -20.0%    1.25x   62.6% -> 78.3%  +15.7 pp    32 -> 256  bandwidth
-  block.qkv        gemm 2048x1536x512    956.18 us  982.40 us   +2.7%    0.97x   97.8% -> 95.2%   -2.6 pp            -  compute
-  block.attention  attn b1 h8 s2048 d64   5.690 ms   5.751 ms   +1.1%    0.99x   43.8% -> 43.4%   -0.5 pp            -  compute
-  block.gelu       elem n=1048576         49.99 us   52.98 us   +6.0%    0.94x  100.8% -> 95.2%   -5.7 pp          256  bandwidth
+  kernel           shape                  baseline  candidate   delta  speedup  verdict        eff a->b     d eff  tgroup a->b  bound
+  ---------------  --------------------  ---------  ---------  ------  -------  -------  --------------  --------  -----------  ---------
+  block.rmsnorm    norm n=1048576         77.98 us   60.59 us  -22.3%    1.29x  faster   64.6% -> 83.2%  +18.6 pp    32 -> 256  bandwidth
+  block.qkv        gemm 2048x1536x512    982.12 us  973.89 us   -0.8%    1.01x  no call  95.2% -> 96.0%   +0.8 pp            -  compute
+  block.attention  attn b1 h8 s2048 d64   6.086 ms   5.999 ms   -1.4%    1.01x  no call  41.0% -> 41.6%   +0.6 pp            -  compute
+  block.gelu       elem n=1048576         54.10 us   58.12 us   +7.4%    0.93x  no call  93.2% -> 86.7%   -6.4 pp          256  bandwidth
 
-  matched 4/4 kernels — total 6.777 ms -> 6.850 ms (+1.1%)
+  baseline/candidate are medians over the timed repeats.
+  verdict compares those medians and is withheld ("no call") when the two
+  min-p95 spreads overlap: a gap narrower than the run-to-run noise that
+  produced it is not a result. `report` prints each side's spread.
+
+  matched 4/4 kernels — total 7.201 ms -> 7.092 ms (-1.5%)
+  1 moved beyond both spreads, 3 within noise (no call)
+  - block.qkv: 0.959-1.002 ms vs 0.952-0.987 ms — medians differ by -0.8%, spreads overlap
+  - block.attention: 5.995-6.127 ms vs 5.931-6.040 ms — medians differ by -1.4%, spreads overlap
+  - block.gelu: 52.5-57.1 us vs 51.7-67.9 us — medians differ by +7.4%, spreads overlap
   occupancy changes:
-  - block.rmsnorm: 32 -> 256 threads/threadgroup (+15.7 pp of pipeline max), limiter tinyThreadgroup -> none
+  - block.rmsnorm: 32 -> 256 threads/threadgroup (+21.9 pp of pipeline max), limiter tinyThreadgroup -> none
 ```
 
-The norm kernel got 1.25x faster and the limiter went away. The other three rows
-moved by 1–6% in both directions and mean nothing — see
-[run-to-run variance](#calibration-varies-run-to-run). The
-`occupancy changes:` line is the part you can actually trust from a single pair
-of runs, because it is a statement about shapes, not about a stopwatch.
+This is the shape of a good result. One kernel changed, and it is the only row
+with a verdict: `block.rmsnorm` is **1.29x faster**, its `tinyThreadgroup`
+limiter is gone, and its `[min, p95]` interval no longer touches the baseline's.
+
+The other three rows moved by 0.8–7.4% and the tool declines to interpret any of
+them. `block.gelu` is the one to notice: **+7.4% would read as a regression**
+introduced by the fix, and it is not — its two spreads (52.5–57.1 µs and
+51.7–67.9 µs) overlap almost completely. Without repeats you would have gone
+looking for a cache effect that does not exist.
+
+The `occupancy changes:` line needs no repeats at all, because it is a statement
+about shapes rather than a stopwatch reading. See
+[trusting a delta](#trusting-a-delta) for what the rule does and does not catch.
 
 ### 7.4 The capture API
 
@@ -931,6 +1045,7 @@ try session.capture(label: "attn.sdpa",
                     shape: .attention(b: 1, h: 8, s: 512, d: 64),
                     precision: .fp16,
                     iterations: 32,
+                    repeats: 5,                                 // + 1 discarded warm-up
                     notes: ["backend": "custom"]) { region in
     for _ in 0..<32 {
         let encoder = try region.makeComputeCommandEncoder()   // stage-sampled
@@ -946,8 +1061,9 @@ try session.writeTrace()          // honours $METALSCOPE_TRACE
 
 | member | what it does |
 | --- | --- |
-| `capture(label:shape:precision:iterations:notes:_:)` | one region = one command buffer, committed and waited on. `iterations` is how many times the body encodes the annotated work; the recorded duration is the measured span ÷ `iterations` |
-| `captureCompute(...)` | shorthand for a region that is exactly one compute encoder |
+| `capture(label:shape:precision:iterations:repeats:warmupRuns:notes:_:)` | `iterations` is how many times the body encodes the annotated work into **one** command buffer, committed and waited on; the duration is that span ÷ `iterations`. `repeats` (default 1) runs the body that many times over, each into its own command buffer, and appends **one** record holding every sample, with `durationSeconds` set to their median |
+| `warmupRuns:` | regions run and discarded before the timed repeats. Defaults to 1 when `repeats > 1` and 0 otherwise, so no timed sample pays the GPU's clock ramp. Pass 0 explicitly if your workload is already warm |
+| `captureCompute(...)` | shorthand for a region that is exactly one compute encoder; takes `repeats`/`warmupRuns` too |
 | `region.makeComputeCommandEncoder(label:)` | a compute encoder whose start/end are sampled into the region's counter buffers |
 | `region.dispatchThreads(_:pipeline:threads:threadsPerThreadgroup:)` | sets the pipeline, encodes the dispatch, **and** records its static occupancy in one call |
 | `region.dispatchThreadgroups(_:pipeline:threadgroupsPerGrid:threadsPerThreadgroup:)` | the same, for a grid declared in threadgroups |
@@ -963,6 +1079,14 @@ The pipeline has to be handed over explicitly because **Metal offers no way to
 ask an encoder which pipeline it is holding**, and metalscope will not swizzle to
 find out. Dispatching straight on the encoder still works and is still timed —
 the kernel just carries no `occupancy` block.
+
+`repeats` defaults to 1, so an existing caller is unchanged and records no
+spread; `diff` will then print `-` in the verdict column rather than reading one
+point as a measurement. Everything that is *not* aggregated across repeats —
+`stages`, `counters`, `occupancy`, `hostDurationSeconds` — comes from the single
+repeat whose duration is the reported median, because summing or averaging them
+would describe a run that never happened. `timingSource` is the exception and
+goes the other way: it is the worst tier any repeat reached.
 
 ### 7.5 Shape annotations
 
@@ -1042,18 +1166,26 @@ the same binary, the same kernels, the same annotations, at sequence length 256
 
 ```
 $ metalscope profile --output block-small.json -- ./.build/release/block-bench
-  kernel           shape                prec  time/iter   GFLOP/s  GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
-  ---------------  -------------------  ----  ---------  --------  ----  ----  ---------  --------  -----  ------  -----  --------
-  block.rmsnorm    norm n=131072        fp32   50.88 us   12.9 GF  20.6  0.62  bandwidth  104.0 GF  12.4%      32   3.1%  counters
-  block.qkv        gemm 256x1536x512    fp32  211.09 us   1.91 TF  24.8  76.8  compute     3.45 TF  55.4%       -      -  cmdbuf
-  block.attention  attn b1 h8 s256 d64  fp32  508.31 us  264.0 GF   4.1  64.0  compute     3.45 TF   7.7%       -      -  cmdbuf
-  block.gelu       elem n=131072        fp32   40.25 us    3.3 GF  26.0  0.12  bandwidth   20.8 GF  15.7%     256  25.0%  counters
+  kernel           shape                prec  time/iter          spread   GFLOP/s  GB/s    AI  bound       ceiling    eff  tgroup    occ  timing
+  ---------------  -------------------  ----  ---------  --------------  --------  ----  ----  ---------  --------  -----  ------  -----  --------
+  block.rmsnorm    norm n=131072        fp32   28.86 us    27.1-41.9 us   22.7 GF  36.3  0.62  bandwidth  104.0 GF  21.8%      32   3.1%  counters
+  block.qkv        gemm 256x1536x512    fp32  263.85 us  198.1-324.7 us   1.53 TF  19.9  76.8  compute     3.45 TF  44.3%       -      -  cmdbuf
+  block.attention  attn b1 h8 s256 d64  fp32  399.34 us  341.7-472.8 us  336.1 GF   5.3  64.0  compute     3.45 TF   9.8%       -      -  cmdbuf
+  block.gelu       elem n=131072        fp32   38.10 us    29.1-60.7 us    3.4 GF  27.5  0.12  bandwidth   20.8 GF  16.5%     256  25.0%  counters
 ```
 
-versus the `seq=2048` table in [§7.2](#72-running-it): 12.4% → 62.6%,
-55.4% → 97.8%, 7.7% → 43.8%, 15.7% → 100.8%. Nothing about the code changed. At
+versus the `seq=2048` table in [§7.2](#72-running-it): 21.8% → 64.6%,
+44.3% → 95.2%, 9.8% → 41.0%, 16.5% → 93.2%. Nothing about the code changed. At
 the small size the numbers are dominated by dispatch launch overhead and by the
 GPU never leaving its low-power clock state.
+
+**The `spread` column diagnoses this without the second table.** `block.qkv` is
+198.1–324.7 µs — a band 48% of its own median wide — and `block.gelu` is
+29.1–60.7 µs, which is 83%. A kernel whose five runs disagree by half cannot
+support a three-significant-figure efficiency, and the report is telling you so
+in the row itself. At `seq=2048` the same two kernels come in at 4% and 6%.
+Wide spreads at a small working set are the first thing to check when a roofline
+number looks implausible.
 
 Two rules follow:
 
@@ -1140,26 +1272,90 @@ the hardware *can* do, the highest measurement is the right one to keep, which
 is why `calibrate` takes the best of `--repeats` rather than the mean — and why
 you should run it on an otherwise idle machine.
 
-The same noise floor applies to `bench` and `profile`, which capture **one** run
-per kernel with no best-of. A single `diff` of a single pair of runs is not
-evidence:
+### Trusting a delta
 
-- In [§7.3](#73-fixing-what-it-found-and-proving-it), `block.qkv` — unchanged
-  code — moved by +2.7%, and `block.gelu` — also unchanged — by +6.0%.
-- In [§2](#metalscope-diff--what-moved), `ffn.gemm` moved from 66.1% to 94.3%
-  between two `bench` runs because MPS chose differently for the same shape.
-- Before the example's iteration counts were raised, the `block.rmsnorm` baseline
-  measured anywhere from 77 µs to 195 µs across five runs, making the same fix
-  look like anything from 1.02x to 2.16x.
+Kernel work is a loop whose whole payload is one bit: *did that change help?* On
+microsecond kernels, a single timed run per side answers that bit confidently
+and at random.
 
-Practical advice: repeat the pair, look for the delta that survives, and weight
-the `occupancy changes:` section heavily — it reports a change in *shape*, which
-does not have a noise floor.
+Here are four captures of `bench --variant baseline` at a small working set —
+identical code, identical flags — with one timed run each, and then the same
+four with the default five repeats:
+
+```
+$ for i in 1 2 3 4; do
+>   metalscope bench --variant baseline --size 512 --seq 256 --heads 4 \
+>     --elements-mb 4 --target-ms 20 --repeats 1 --output us-s$i.json --quiet
+>   metalscope bench --variant baseline --size 512 --seq 256 --heads 4 \
+>     --elements-mb 4 --target-ms 20 --repeats 5 --output us-m$i.json --quiet
+> done
+
+  kernel         single-run, 4 captures    5 repeats, 4 captures
+  -------------  -----------------------  -----------------------
+  ffn.gemm       156.8 -  349.9 us  2.23x  104.7 - 108.8 us  1.04x
+  ffn.gemm.half  124.6 -  289.4 us  2.32x   94.3 -  98.7 us  1.05x
+  attn.sdpa      170.1 -  333.5 us  1.96x  172.6 - 178.3 us  1.03x
+  block.rmsnorm   58.4 -   92.8 us  1.59x   58.9 -  61.9 us  1.05x
+  act.scale       51.6 -   67.2 us  1.30x   49.6 -  51.0 us  1.03x
+  stream.triad    64.6 -   80.7 us  1.25x   58.7 -  62.9 us  1.07x
+```
+
+Diff two of the single-run captures against each other and you get a report on
+code that never changed:
+
+```
+$ metalscope diff us-s1.json us-s2.json
+...
+  kernel         shape                   baseline  candidate    delta  speedup         eff a->b     d eff
+  -------------  ---------------------  ---------  ---------  -------  -------  ---------------  --------
+  ffn.gemm       gemm 512x512x512       349.88 us  179.47 us   -48.7%    1.95x   22.3% -> 43.4%  +21.1 pp
+  ffn.gemm.half  gemm 512x512x512       124.57 us  289.37 us  +132.3%    0.43x   64.7% -> 27.8%  -36.8 pp
+  attn.sdpa      attn b1 h4 s256 d64    170.13 us  333.49 us   +96.0%    0.51x    11.4% -> 5.8%   -5.6 pp
+  block.rmsnorm  norm n=1048576          58.41 us   92.77 us   +58.8%    0.63x   86.3% -> 54.3%  -32.0 pp
+  act.scale      elem n=1048576          52.09 us   64.44 us   +23.7%    0.81x   96.8% -> 78.2%  -18.5 pp
+  stream.triad   opaque 2.10MF/12.58MB   65.44 us   80.57 us   +23.1%    0.81x  115.6% -> 93.9%  -21.7 pp
+
+  both traces are single-run, so every delta below includes run-to-run noise
+  and no winner can be called. Re-capture with `metalscope bench --repeats 5`.
+```
+
+Two things are doing work here. **Repeating with a warm-up** narrows the numbers
+themselves: `bench` runs one discarded region per kernel before the timed ones,
+so no sample pays the GPU's clock ramp — that alone is most of `ffn.gemm`'s
+2.23× collapsing to 1.04×. **The overlap rule** then governs what the tool is
+willing to say about what remains:
+
+> `diff` compares the two medians and withholds a verdict — printing `no call` —
+> when the two `[min, p95]` intervals overlap. A gap narrower than the
+> run-to-run noise that produced it is not a result.
+
+Over all six pairings of those four unchanged captures:
+
+| | comparisons that read as a result | worst |
+| --- | --- | --- |
+| single-run, `\|delta\| > 5%` | **30 of 36** | 132% |
+| five repeats, verdict given at all | **4 of 36** | 7.2% median gap |
+
+Note the second row is not zero, and the docs do not round it to zero. Two
+five-sample intervals can land disjoint by luck; the rule turns 2× phantoms into
+occasional marginal ones, which is a different problem from the one it started
+with but not no problem. In practice:
+
+- **Read `verdict` before `delta`.** A `no call` beside `-3.7%` means the number
+  is real and the interpretation is not available.
+- **A verdict on a gap of a few percent deserves a re-run**, especially on a
+  kernel you did not touch.
+- **More repeats narrow the intervals.** `--repeats 15` on a kernel you are
+  actively tuning costs seconds and makes small wins resolvable.
+- **`occupancy changes:` needs no repeats at all**, because a threadgroup size
+  is a fact about shape rather than a stopwatch reading.
+- **Run on an idle machine**, same as for `calibrate`. The rule accounts for
+  noise; it cannot account for a compile job that started halfway through.
 
 ### Efficiency over 100%
 
-`eff` above 100% is legal and worth reading, not a bug. `block.gelu` reports
-100.8% and `stream.triad` has been seen at 101.4%. There are three causes, in
+`eff` above 100% is legal and worth reading, not a bug. `block.gelu` has been
+seen at 100.8% and `stream.triad` at 101.4%. There are three causes, in
 rough order of likelihood:
 
 1. **The analytic byte model over-counts.** Bytes are *compulsory DRAM traffic*.
@@ -1179,16 +1375,16 @@ anything above ~95% as "no headroom here" and go look elsewhere.
 This is the part of the report that most distinguishes metalscope from a table
 of counters, so it is worth seeing both outcomes.
 
-**Case 1 — the defect costs lanes, not time.** Reporting the `baseline` trace
-against peaks measured in the same machine state:
+**Case 1 — the defect costs lanes, not time.** The `baseline` trace from
+[§2](#metalscope-report--the-roofline-table):
 
 ```
-$ metalscope report baseline.json --peaks-file peaks-verify.json
+$ metalscope report baseline.json
   ...
-  act.scale      elem n=16777216          fp32  900.11 us   18.6 GF  149.1  0.12  bandwidth  18.5 GF  100.9%    100*   9.8%  counters
+  act.scale      elem n=16777216          fp32  866.91 us  866.3-884.3 us   19.4 GF  154.8  0.12  bandwidth   20.8 GF  93.0%    100*   9.8%  counters
   ...
   headroom:
-  - act.scale: threadgroup of 100 is not a multiple of the 32-wide SIMD group — 28 of 128 lanes idle in every threadgroup (78.1% lane use); round to 96 or 128; note it is already at 100.9% of its bandwidth ceiling, so this costs lanes, not time
+  - act.scale: threadgroup of 100 is not a multiple of the 32-wide SIMD group — 28 of 128 lanes idle in every threadgroup (78.1% lane use); round to 96 or 128; note it is already at 93.0% of its bandwidth ceiling, so this costs lanes, not time
 ```
 
 The threadgroup really is malformed — 28 of every 128 lanes are launched with
@@ -1198,10 +1394,16 @@ back lanes, not microseconds, and the report says so rather than sending you off
 to fix a defect that is not costing anything. This caveat fires whenever the
 kernel is at ≥90% of its ceiling.
 
+The `diff` in [§2](#metalscope-diff--what-moved) confirms it from the other
+direction: `tuned` does fix the threadgroup to 256, the limiter clears, and the
+timing verdict is `no call`. The structural finding was real and worth exactly
+the lanes it said.
+
 **Case 2 — the defect costs time.** `block.rmsnorm` in
-[§7.2](#72-running-it) has a `tinyThreadgroup` limiter and sits at 62.6% of its
+[§7.2](#72-running-it) has a `tinyThreadgroup` limiter and sits at 64.6% of its
 bandwidth ceiling — well clear of the caveat threshold. No caveat is printed,
-and the fix in [§7.3](#73-fixing-what-it-found-and-proving-it) does buy 1.25x.
+and the fix in [§7.3](#73-fixing-what-it-found-and-proving-it) buys 1.29x, with
+a verdict of `faster` rather than a `no call`.
 
 The rule: **a structural occupancy finding is only actionable when the kernel has
 roofline headroom.** metalscope does that check for you.
@@ -1390,6 +1592,7 @@ Run `metalscope help` for the full flag list.
 | `--output PATH` | `bench`, `profile` | trace destination |
 | `--no-report` | `profile` | collect the trace without printing |
 | `--variant baseline\|tuned` | `bench` | which self-test kernels to run |
+| `--repeats N` | `bench` | timed runs per kernel after one discarded warm-up (default 5). `1` records no spread and makes `diff` withhold every verdict. For `calibrate` the same flag means runs per workload, best one kept |
 
 ### Errors
 
@@ -1409,6 +1612,9 @@ metalscope: missing argument: <trace.json>                                 # exi
 $ metalscope repot
 metalscope: unknown command 'repot' — run `metalscope help`                # exit 2
 
+$ metalscope bench --repeats 0
+metalscope: bad value '0' for --repeats: expected at least 1               # exit 2
+
 $ metalscope profile -- /bin/echo hello
 hello
 metalscope: child wrote no trace at ~/work/metalscope-trace.json.
@@ -1420,8 +1626,13 @@ A trace whose `schemaVersion` is newer than this build understands is rejected
 rather than partially read:
 
 ```
-metalscope: trace schema version 3 is newer than supported version 2
+$ metalscope report future.json
+metalscope: trace schema version 4 is newer than supported version 3       # exit 1
 ```
+
+Older traces read fine. A v1 or v2 trace simply carries no occupancy block and
+no repeat samples, and `report`/`diff` drop those columns rather than inventing
+values — see [§6](#6-diff).
 
 ---
 
@@ -1429,7 +1640,7 @@ metalscope: trace schema version 3 is newer than supported version 2
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the design, the timing ladder, why the
   peaks are measured
-- [TRACE-FORMAT.md](TRACE-FORMAT.md) — the JSON schema (v2), field by field
+- [TRACE-FORMAT.md](TRACE-FORMAT.md) — the JSON schema (v3), field by field
 - [COUNTER-MATRIX.md](COUNTER-MATRIX.md) — what each chip exposes
 - [WHITEPAPER.md](WHITEPAPER.md) — the argument, the evaluation, and the
   limitations in full
