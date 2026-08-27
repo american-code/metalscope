@@ -56,13 +56,17 @@ enum ReportCommand {
                         occupancyDetail: args.has("occupancy"))
     }
 
-    /// Resolve which peaks to score against: an explicit file, the trace's own
-    /// measured peaks, the local cache, or (last) spec-sheet folklore.
+    /// Resolve which peaks to score against: an explicit file (which must hold
+    /// a measured entry — no fallback), the trace's own measured peaks, the
+    /// local cache, or (last) spec-sheet folklore.
     static func resolvePeaks(for trace: Trace, args: Arguments) throws -> PeakSet {
         if let path = args.string("peaks-file") {
             let store = PeaksStore(url: URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
-            if let peaks = store.resolve(for: trace.device.name) { return peaks }
-            throw CLIError.message("no peaks for '\(trace.device.name)' in \(path)")
+            do {
+                return try store.requireMeasured(for: trace.device.name)
+            } catch let error as PeaksFileError {
+                throw CLIError.message(error.description)
+            }
         }
         if args.has("spec-peaks") {
             guard let folklore = ChipPeaks.folklore(for: trace.device.name)?.peakSet else {

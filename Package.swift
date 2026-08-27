@@ -15,6 +15,6 @@ let package = Package(
         .target(name: "MetalscopeCore"),
         .target(name: "MetalscopeCapture", dependencies: ["MetalscopeCore"]),
         .executableTarget(name: "metalscope", dependencies: ["MetalscopeCore", "MetalscopeCapture"]),
-        .testTarget(name: "metalscopeTests", dependencies: ["MetalscopeCore", "MetalscopeCapture"]),
+        .testTarget(name: "metalscopeTests", dependencies: ["MetalscopeCore", "MetalscopeCapture", "metalscope"]),
     ]
 )

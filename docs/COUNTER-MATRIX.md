@@ -34,7 +34,7 @@ Columns:
 
 ### The partial M1 Max row
 
-A Mac Studio M1 Max (lab-02) running the same macOS 26.5.1 reports the **same
+A Mac Studio M1 Max (studio-b) running the same macOS 26.5.1 reports the **same
 timestamp-only counter situation** as the M1 Pro: `MTLDevice.counterSets`
 contains `timestamp` and nothing else. That is the one fact confirmed on that
 machine, and it is the one recorded.

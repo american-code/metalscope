@@ -77,7 +77,7 @@ metalscope 0.1.0
     memory bandwidth        166.4 GB/s
     ridge point (fp32)  20.7 FLOP/byte
     ridge point (fp16)  20.0 FLOP/byte
-    source: /Users/melton/.metalscope/peaks.json
+    source: ~/.metalscope/peaks.json
 ```
 
 Line by line:
@@ -449,7 +449,8 @@ estimate it.
 
 `report` and `diff` resolve peaks in this order:
 
-1. `--peaks-file PATH`
+1. `--peaks-file PATH` — the file must hold a **measured** entry for the
+   trace's device; anything else is an error, never a fallback
 2. the trace's own `peaks`, if they are `measured`
 3. `~/.metalscope/peaks.json`
 4. whatever the trace carried (possibly folklore)
@@ -491,10 +492,10 @@ the headroom list as the second-worst kernel in the trace. Same trace, same
 kernel, same microseconds — one of those two readings sends you off to spend a
 week rewriting a GEMM that is already essentially optimal.
 
-> **Caveat.** `--peaks-file` pointing at a file that has no measured entry for
-> this device silently falls back to spec-sheet folklore (labelled as such)
-> rather than erroring. The label is honest, but the flag is not as strict as it
-> looks; check for `[measured]` in the header.
+> **Strictness.** `--peaks-file` never falls back. A file that cannot be read,
+> cannot be parsed, has no entry for the trace's device, or holds a non-measured
+> entry is an error — and the message says which of those it was. Only the
+> implicit order above (steps 2–4) can land on folklore.
 
 ---
 

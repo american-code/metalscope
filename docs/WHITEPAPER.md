@@ -361,7 +361,7 @@ used by every table the tool prints — was at 0%.
 | fp16 compute | 3.33 TF | 10.4 TF | 32% |
 | memory bandwidth | 166.4 GB/s | 200 GB/s | **83%** |
 
-A second machine (lab-02, a Mac Studio M1 Max, macOS 26.5.1) gives an
+A second machine (studio-b, a Mac Studio M1 Max, macOS 26.5.1) gives an
 independent data point:
 
 | | measured | spec-sheet | ratio |
