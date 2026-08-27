@@ -175,14 +175,88 @@ public final class CaptureSession {
     /// - Parameter iterations: how many times `body` encodes the annotated work.
     ///   The recorded duration is the measured span divided by this, which is how
     ///   you get a stable number out of a kernel that runs in tens of microseconds.
+    /// - Parameter repeats: how many separate timed regions to run. One record is
+    ///   appended whatever this is: `durationSeconds` becomes the median and
+    ///   `durationSamplesSeconds` carries every sample, so a reader can see the
+    ///   spread instead of guessing at it. Dividing a long region by its
+    ///   iteration count controls the GPU's clock ramp but says nothing about
+    ///   run-to-run variance, which on a microsecond kernel is the larger term.
+    /// - Parameter warmupRuns: regions to run and throw away first, so the timed
+    ///   repeats all see an already-ramped GPU. Defaults to one when repeating
+    ///   and none when not — a lone run has nothing to be consistent with.
+    /// - Returns: the value from the last timed repeat.
     @discardableResult
     public func capture<T>(label: String,
                            shape: KernelShape,
                            precision: Precision = .fp32,
                            iterations: Int = 1,
+                           repeats: Int = 1,
+                           warmupRuns: Int? = nil,
                            notes: [String: String]? = nil,
                            _ body: (CaptureRegion) throws -> T) throws -> T {
         precondition(iterations >= 1, "iterations must be >= 1")
+        precondition(repeats >= 1, "repeats must be >= 1")
+        let warmups = warmupRuns ?? (repeats > 1 ? 1 : 0)
+        precondition(warmups >= 0, "warmupRuns must be >= 0")
+
+        for _ in 0..<warmups {
+            _ = try runRegion(label: "\(label).warmup", iterations: iterations, body)
+        }
+
+        var runs: [RunResult<T>] = []
+        runs.reserveCapacity(repeats)
+        for _ in 0..<repeats {
+            runs.append(try runRegion(label: label, iterations: iterations, body))
+        }
+
+        let samples = runs.map(\.perIterationSeconds)
+        // Lower median, by index, so every non-aggregated field below comes from
+        // one repeat that actually happened rather than a blend of several.
+        let ranked = samples.indices.sorted { samples[$0] < samples[$1] }
+        let representative = runs[ranked[(runs.count - 1) / 2]]
+        // A record covering several runs claims the worst tier any of them
+        // reached; a duration is only as trustworthy as its weakest sample.
+        let source = runs.map(\.source).max { $0.tierRank < $1.tierRank } ?? representative.source
+
+        records.append(KernelRecord(label: label,
+                                    shape: shape,
+                                    precision: precision,
+                                    durationSeconds: representative.perIterationSeconds,
+                                    iterations: iterations,
+                                    timingSource: source,
+                                    hostDurationSeconds: representative.hostSeconds,
+                                    stages: representative.stages.isEmpty ? nil : representative.stages,
+                                    occupancy: representative.occupancy,
+                                    counters: representative.counters.isEmpty ? nil : representative.counters,
+                                    durationSamplesSeconds: repeats > 1 ? samples : nil,
+                                    notes: notes))
+        return runs[runs.count - 1].value
+    }
+
+    /// Convenience for the common case of a single compute encoder that the
+    /// caller dispatches into `iterations` times.
+    @discardableResult
+    public func captureCompute<T>(label: String,
+                                  shape: KernelShape,
+                                  precision: Precision = .fp32,
+                                  iterations: Int = 1,
+                                  repeats: Int = 1,
+                                  warmupRuns: Int? = nil,
+                                  notes: [String: String]? = nil,
+                                  _ body: (MTLComputeCommandEncoder) throws -> T) throws -> T {
+        try capture(label: label, shape: shape, precision: precision,
+                    iterations: iterations, repeats: repeats, warmupRuns: warmupRuns,
+                    notes: notes) { region in
+            let encoder = try region.makeComputeCommandEncoder(label: label)
+            defer { encoder.endEncoding() }
+            return try body(encoder)
+        }
+    }
+
+    /// One timed region: everything `capture` used to do before repeats existed.
+    private func runRegion<T>(label: String,
+                              iterations: Int,
+                              _ body: (CaptureRegion) throws -> T) throws -> RunResult<T> {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw CaptureError.commandBufferCreationFailed
         }
@@ -212,37 +286,25 @@ public final class CaptureSession {
 
         let timing = resolveTiming(region: region, commandBuffer: commandBuffer,
                                    scale: scale, hostSeconds: hostSeconds)
-        let counters = resolveAuxiliaryCounters(region: region)
 
-        records.append(KernelRecord(label: label,
-                                    shape: shape,
-                                    precision: precision,
-                                    durationSeconds: timing.total / Double(iterations),
-                                    iterations: iterations,
-                                    timingSource: timing.source,
-                                    hostDurationSeconds: hostSeconds,
-                                    stages: timing.stages.isEmpty ? nil : timing.stages,
-                                    occupancy: OccupancyInfo.fold(region.occupancyObservations),
-                                    counters: counters.isEmpty ? nil : counters,
-                                    notes: notes))
-        return result
+        return RunResult(value: result,
+                         perIterationSeconds: timing.total / Double(iterations),
+                         source: timing.source,
+                         stages: timing.stages,
+                         occupancy: OccupancyInfo.fold(region.occupancyObservations),
+                         counters: resolveAuxiliaryCounters(region: region),
+                         hostSeconds: hostSeconds)
     }
 
-    /// Convenience for the common case of a single compute encoder that the
-    /// caller dispatches into `iterations` times.
-    @discardableResult
-    public func captureCompute<T>(label: String,
-                                  shape: KernelShape,
-                                  precision: Precision = .fp32,
-                                  iterations: Int = 1,
-                                  notes: [String: String]? = nil,
-                                  _ body: (MTLComputeCommandEncoder) throws -> T) throws -> T {
-        try capture(label: label, shape: shape, precision: precision,
-                    iterations: iterations, notes: notes) { region in
-            let encoder = try region.makeComputeCommandEncoder(label: label)
-            defer { encoder.endEncoding() }
-            return try body(encoder)
-        }
+    /// One timed region's output, before repeats are folded into a record.
+    private struct RunResult<T> {
+        var value: T
+        var perIterationSeconds: Double
+        var source: TimingSource
+        var stages: [StageSample]
+        var occupancy: OccupancyInfo?
+        var counters: [String: Double]
+        var hostSeconds: Double
     }
 
     /// Discard recorded kernels (e.g. after warmup).

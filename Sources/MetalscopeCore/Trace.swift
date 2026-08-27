@@ -17,6 +17,17 @@ public enum TimingSource: String, Codable, Sendable {
         case .host: return "host"
         }
     }
+
+    /// Position on the timing ladder, 0 being the best. A record covering
+    /// several runs claims the worst tier any of them reached, for the same
+    /// reason a region claims tier 1 only if *every* encoder in it was sampled.
+    public var tierRank: Int {
+        switch self {
+        case .counterSampleBuffer: return 0
+        case .commandBuffer: return 1
+        case .host: return 2
+        }
+    }
 }
 
 /// A sub-span inside a captured region (one compute encoder, typically).
@@ -39,7 +50,9 @@ public struct KernelRecord: Codable, Sendable, Equatable {
     public var label: String
     public var shape: KernelShape
     public var precision: Precision
-    /// Seconds for ONE invocation (total measured span / iterations).
+    /// Seconds for ONE invocation (total measured span / iterations). When the
+    /// region was repeated, this is the median of `durationSamplesSeconds` —
+    /// the lower median, so it is a run that actually happened.
     public var durationSeconds: Double
     /// How many times the annotated work was encoded inside the region.
     public var iterations: Int
@@ -58,6 +71,13 @@ public struct KernelRecord: Codable, Sendable, Equatable {
     /// `"<counter set>.<counter>"` and summed over the region's encoders. Absent
     /// on every chip that exposes only the `timestamp` counter set.
     public var counters: [String: Double]?
+    /// Per-invocation seconds for each timed repeat, in the order they ran
+    /// (schema v3). Absent when the region was captured once, which is what a
+    /// v1/v2 trace and `--repeats 1` both produce.
+    ///
+    /// Only the samples are stored; min/median/mean/p95 are derived on read via
+    /// `runStatistics`, so a trace cannot contradict its own summary.
+    public var durationSamplesSeconds: [Double]?
     public var notes: [String: String]?
 
     public init(label: String,
@@ -72,6 +92,7 @@ public struct KernelRecord: Codable, Sendable, Equatable {
                 stages: [StageSample]? = nil,
                 occupancy: OccupancyInfo? = nil,
                 counters: [String: Double]? = nil,
+                durationSamplesSeconds: [Double]? = nil,
                 notes: [String: String]? = nil) {
         self.label = label
         self.shape = shape
@@ -85,6 +106,7 @@ public struct KernelRecord: Codable, Sendable, Equatable {
         self.stages = stages
         self.occupancy = occupancy
         self.counters = counters
+        self.durationSamplesSeconds = durationSamplesSeconds
         self.notes = notes
     }
 
@@ -95,6 +117,12 @@ public struct KernelRecord: Codable, Sendable, Equatable {
 
     public var arithmeticIntensity: Double {
         bytes > 0 ? flops / bytes : 0
+    }
+
+    /// Run-to-run statistics, derived from the stored samples. nil for a
+    /// single-run capture — absent means "not measured", never "no spread".
+    public var runStatistics: RunStatistics? {
+        durationSamplesSeconds.flatMap(RunStatistics.init(samples:))
     }
 }
 
@@ -128,10 +156,11 @@ public struct DeviceInfo: Codable, Sendable, Equatable {
 /// The single JSON schema shared by capture, `report`, and `diff`.
 /// Documented in docs/TRACE-FORMAT.md.
 public struct Trace: Codable, Sendable, Equatable {
-    /// Bumped to 2 when `kernels[].occupancy` and `kernels[].counters` were added.
-    public static let currentSchemaVersion = 2
-    /// Oldest schema this build still reads. v1 traces decode unchanged: every v2
-    /// addition is optional, so an old trace simply has no occupancy block.
+    /// Bumped to 3 when `kernels[].durationSamplesSeconds` was added.
+    public static let currentSchemaVersion = 3
+    /// Oldest schema this build still reads. v1 and v2 traces decode unchanged:
+    /// every addition since has been optional, so an old trace simply has no
+    /// occupancy block and no repeat samples.
     public static let minimumReadableSchemaVersion = 1
 
     public var schemaVersion: Int

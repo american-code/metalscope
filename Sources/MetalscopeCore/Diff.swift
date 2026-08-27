@@ -44,6 +44,63 @@ public struct DiffEntry: Sendable, Equatable {
         return a.durationSeconds / b.durationSeconds
     }
 
+    // MARK: - Verdict
+
+    /// Whether the median moved by more than the two sides' measurement noise.
+    ///
+    /// The point of the distinction is that a diff of microsecond-scale kernels
+    /// will *always* show a delta, and most of them are the stopwatch rather
+    /// than the code.
+    public enum Verdict: String, Sendable {
+        case faster
+        case slower
+        /// Medians differ, but the two [min, p95] intervals overlap, so the
+        /// difference is inside the noise that produced it.
+        case withinNoise = "within-noise"
+        /// One or both sides were captured once. A single run has no spread, so
+        /// there is nothing to compare a delta against.
+        case unmeasured
+
+        /// Table text. "no call" rather than "same": an overlap means the runs
+        /// could not be told apart, not that they are equal.
+        public var displayName: String {
+            switch self {
+            case .faster: return "faster"
+            case .slower: return "slower"
+            case .withinNoise: return "no call"
+            case .unmeasured: return "-"
+            }
+        }
+    }
+
+    /// Both sides' run statistics, when both sides were repeated. A single-run
+    /// trace on either side leaves this nil rather than presenting one point as
+    /// a distribution.
+    public var runStatistics: (baseline: RunStatistics, candidate: RunStatistics)? {
+        guard let a = baseline?.runStatistics, let b = candidate?.runStatistics,
+              a.hasSpread, b.hasSpread else { return nil }
+        return (a, b)
+    }
+
+    /// nil when either side lacks repeat data.
+    public var spreadsOverlap: Bool? {
+        runStatistics.map { $0.baseline.overlaps($0.candidate) }
+    }
+
+    /// The honesty feature: a winner is named only when the two measurement
+    /// intervals are disjoint.
+    public var verdict: Verdict {
+        guard let s = runStatistics else { return .unmeasured }
+        guard !s.baseline.overlaps(s.candidate) else { return .withinNoise }
+        return s.candidate.median < s.baseline.median ? .faster : .slower
+    }
+
+    /// True when either side carries repeat samples — the diff uses this to
+    /// decide whether the verdict column is worth its width.
+    public var hasRunStatistics: Bool {
+        baseline?.runStatistics?.hasSpread == true || candidate?.runStatistics?.hasSpread == true
+    }
+
     public func placements(peaks: PeakSet) -> (baseline: RooflinePlacement?, candidate: RooflinePlacement?) {
         (baseline.map { Roofline.place($0, peaks: peaks) },
          candidate.map { Roofline.place($0, peaks: peaks) })
@@ -100,12 +157,26 @@ public struct DiffEntry: Sendable, Equatable {
 }
 
 public struct TraceDiff: Sendable {
+    /// The refusal rule, printed verbatim wherever a verdict is shown. A rule
+    /// the reader cannot see is a rule they cannot check.
+    public static let verdictRule =
+        "verdict compares medians and is withheld (\"no call\") when the two "
+        + "min-p95 spreads overlap: a gap narrower than the run-to-run noise "
+        + "that produced it is not a result."
+
     public var baselineTrace: Trace
     public var candidateTrace: Trace
     public var entries: [DiffEntry]
 
     public var matched: [DiffEntry] { entries.filter { $0.status == .matched } }
     public var unmatched: [DiffEntry] { entries.filter { $0.status != .matched } }
+
+    /// Matched kernels whose two spreads overlapped, so no winner was called.
+    public var withinNoise: [DiffEntry] { matched.filter { $0.verdict == .withinNoise } }
+    /// Matched kernels that moved beyond both sides' measured spread.
+    public var resolved: [DiffEntry] {
+        matched.filter { $0.verdict == .faster || $0.verdict == .slower }
+    }
 
     public init(baselineTrace: Trace, candidateTrace: Trace) {
         self.baselineTrace = baselineTrace

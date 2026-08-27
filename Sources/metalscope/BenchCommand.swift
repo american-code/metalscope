@@ -9,9 +9,14 @@ import MetalscopeCore
 /// and `diff` something real to chew on.
 enum BenchCommand {
     static let known: Set<String> = ["output", "variant", "size", "iterations", "seq", "heads",
-                                     "elements-mb", "target-ms", "quiet", "report"]
+                                     "elements-mb", "target-ms", "repeats", "quiet", "report"]
     static let valueOptions: Set<String> = ["output", "variant", "size", "iterations", "seq",
-                                            "heads", "elements-mb", "target-ms"]
+                                            "heads", "elements-mb", "target-ms", "repeats"]
+
+    /// Five timed runs per kernel. Enough that the median is not one sample's
+    /// opinion and the nearest-rank p95 is the slowest of the five, while still
+    /// keeping `bench` under ten seconds on an M1 Pro.
+    static let defaultRepeats = 5
 
     static func run(_ args: Arguments) throws {
         try args.rejectUnknown(known)
@@ -26,6 +31,10 @@ enum BenchCommand {
         let seq = try args.int("seq", default: 512)
         let heads = try args.int("heads", default: 8)
         let elementsMB = try args.int("elements-mb", default: 64)
+        let repeats = try args.int("repeats", default: defaultRepeats)
+        guard repeats >= 1 else {
+            throw CLIError.badValue("repeats", "\(repeats)", "expected at least 1")
+        }
         let quiet = args.has("quiet")
         let outputPath = args.string("output")
             ?? CaptureSession.environmentTraceURL?.path
@@ -39,6 +48,8 @@ enum BenchCommand {
 
         log("metalscope bench [\(variant.rawValue)] — \(session.device.name)")
         log("  timing: \(session.capabilities.canSampleEncoderStages ? "encoder stage timestamps + command-buffer GPU time" : "command-buffer GPU time")")
+        log("  repeats: \(repeats) timed run\(repeats == 1 ? "" : "s") per kernel"
+            + (repeats > 1 ? ", after a discarded warm-up run" : " — no spread will be recorded"))
 
         let elements = elementsMB * 1024 * 1024 / MemoryLayout<Float>.size
 
@@ -48,7 +59,7 @@ enum BenchCommand {
         func capture(_ runner: Workloads.Runner, label: String) throws {
             let iterations = try explicitIterations
                 ?? workloads.autoIterations(runner, label: label, targetSeconds: targetSeconds)
-            try workloads.run(runner, label: label, iterations: iterations)
+            try workloads.run(runner, label: label, iterations: iterations, repeats: repeats)
         }
 
         try capture(try workloads.makeGEMM(m: size, n: size, k: size, precision: .fp32),
@@ -77,7 +88,8 @@ enum BenchCommand {
 
         let peaks = PeaksStore.default.resolve(for: session.device.name)
         let url = try session.writeTrace(to: output, peaks: peaks,
-                                         notes: ["command": "bench", "variant": variant.rawValue])
+                                         notes: ["command": "bench", "variant": variant.rawValue,
+                                                 "repeats": "\(repeats)"])
         log("  captured \(session.records.count) kernels -> \(url.path)")
         if peaks?.source != .measured {
             log("  note: peaks are spec-sheet folklore — run `metalscope calibrate` for honest efficiency numbers.")

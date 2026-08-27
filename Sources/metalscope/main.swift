@@ -43,6 +43,11 @@ COMMANDS
     --elements-mb N              Elementwise/triad working set per stream in MB.
     --iterations N               Fixed iterations per region (default: auto-sized).
     --target-ms N                Auto-size iterations to ~N ms of GPU work (default 150).
+    --repeats N                  Timed runs per kernel after a discarded warm-up (default 5).
+                                 The trace records every sample; `report` shows the
+                                 median and its spread, and `diff` refuses to call a
+                                 winner when two spreads overlap. --repeats 1 records
+                                 no spread, and diff then withholds every verdict.
     --output PATH                Trace destination.
     --report                     Print the roofline report afterwards.
 
@@ -50,8 +55,9 @@ COMMANDS
     --output PATH                Trace path handed to the child ($METALSCOPE_TRACE).
     --no-report                  Just collect the trace.
 
-  report <trace.json>          Roofline table: duration, GFLOP/s, AI, bound, efficiency,
-                               and static occupancy where the trace has it.
+  report <trace.json>          Roofline table: median duration and its spread, GFLOP/s,
+                               AI, bound, efficiency, and static occupancy where the
+                               trace has it.
     --sort duration|efficiency|intensity
     --occupancy                  Per-kernel static occupancy detail block.
     --spec-peaks                 Force spec-sheet peaks instead of measured.
@@ -60,6 +66,8 @@ COMMANDS
 
   diff <baseline.json> <candidate.json>
                                Align kernels by label + shape and show what moved.
+                               Compares medians; withholds a verdict when the two
+                               traces' min-p95 spreads overlap.
     --json                       Machine-readable output.
 
   help, version

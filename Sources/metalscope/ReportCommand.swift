@@ -45,7 +45,9 @@ enum ReportCommand {
                                efficiency: placement.efficiency,
                                timingSource: record.timingSource.rawValue,
                                occupancy: record.occupancy.map(JSONOccupancy.init),
-                               counters: record.counters)
+                               counters: record.counters,
+                               durationSamplesSeconds: record.durationSamplesSeconds,
+                               runStatistics: record.runStatistics.map(JSONRunStatistics.init))
             }
             let data = try TraceIO.makeEncoder().encode(JSONReport(peaks: peaks, kernels: payload))
             Terminal.out(String(data: data, encoding: .utf8) ?? "{}")
@@ -97,6 +99,9 @@ enum ReportCommand {
                             Fmt.intensity(peaks.ridgePoint(for: .fp32)),
                             peaks.fp16GFLOPS != nil
                                 ? ", \(Fmt.intensity(peaks.ridgePoint(for: .fp16))) FLOP/byte (fp16)" : ""))
+        if let repeatsText = repeatsSummary(trace) {
+            Terminal.out("  repeats: \(repeatsText)")
+        }
         Terminal.out("")
 
         var rows = trace.kernels.enumerated().map { (index: $0.offset, record: $0.element) }
@@ -114,14 +119,18 @@ enum ReportCommand {
 
         // The occupancy columns only earn their width when something in the trace
         // carries occupancy data — a v1 trace, or one made entirely of MPS
-        // regions, has none.
+        // regions, has none. Same for the spread column and single-run traces.
         let showsOccupancy = trace.kernels.contains { $0.occupancy != nil }
+        let showsSpread = trace.kernels.contains { $0.runStatistics?.hasSpread == true }
 
         var columns: [TextTable.Column] = [
             .init("kernel"),
             .init("shape"),
             .init("prec"),
             .init("time/iter", .right),
+        ]
+        if showsSpread { columns.append(.init("spread", .right)) }
+        columns += [
             .init("GFLOP/s", .right),
             .init("GB/s", .right),
             .init("AI", .right),
@@ -144,13 +153,20 @@ enum ReportCommand {
                 record.shape.descriptionText,
                 record.precision.rawValue,
                 Fmt.duration(record.durationSeconds),
+            ]
+            if showsSpread {
+                cells.append(record.runStatistics.flatMap { s in
+                    s.hasSpread ? Fmt.durationRange(s.min, s.p95) : nil
+                } ?? "-")
+            }
+            cells += [
                 Fmt.gflops(placement.achievedGFLOPS),
                 String(format: "%.1f", placement.achievedBandwidthGBs),
                 Fmt.intensity(placement.arithmeticIntensity),
                 placement.bound.displayName,
                 Fmt.gflops(placement.ceilingGFLOPS),
                 Fmt.percent(placement.efficiency),
-            ]
+            ] as [String]
             if showsOccupancy {
                 cells.append(record.occupancy?.tableText ?? "-")
                 cells.append(record.occupancy.map { Fmt.percent($0.threadgroupOccupancy) } ?? "-")
@@ -161,6 +177,10 @@ enum ReportCommand {
         Terminal.out(table.rendered(indent: "  "))
         Terminal.out("")
         Terminal.out("  AI = analytic FLOPs / compulsory bytes. eff = achieved / roofline ceiling at that AI.")
+        if showsSpread {
+            Terminal.out("  time/iter is the median of the timed repeats; spread is min to nearest-rank p95 over the same runs.")
+            Terminal.out("  every other column is computed from the median, so a wide spread is a warning about all of them.")
+        }
         if showsOccupancy {
             Terminal.out("  tgroup = threads/threadgroup (* = not a multiple of the SIMD width). occ = that vs the pipeline's max.")
             Terminal.out("  a dash means metalscope never saw the pipeline (MPS and friends encode their own dispatches).")
@@ -205,6 +225,17 @@ enum ReportCommand {
         if occupancyDetail {
             printOccupancyDetail(rows.map(\.record))
         }
+    }
+
+    /// "5 timed runs per kernel", or a range when the trace mixes counts.
+    /// nil when nothing in the trace was repeated, so a single-run trace prints
+    /// exactly the header it always did.
+    static func repeatsSummary(_ trace: Trace) -> String? {
+        let counts = trace.kernels.compactMap { $0.runStatistics?.count }.filter { $0 > 1 }
+        guard let low = counts.min(), let high = counts.max() else { return nil }
+        let range = low == high ? "\(low)" : "\(low)-\(high)"
+        return "\(range) timed run\(high == 1 ? "" : "s") per kernel"
+            + (counts.count < trace.kernels.count ? " (some kernels captured once)" : "")
     }
 
     /// Per-kernel static occupancy block (`report --occupancy`).
@@ -264,6 +295,31 @@ enum ReportCommand {
         var timingSource: String
         var occupancy: JSONOccupancy?
         var counters: [String: Double]?
+        var durationSamplesSeconds: [Double]?
+        var runStatistics: JSONRunStatistics?
+    }
+
+    /// Repeat statistics for machine consumers: the samples are in the trace,
+    /// the summary is derived here, so an autotuner reading this doesn't
+    /// re-implement the percentile convention.
+    struct JSONRunStatistics: Encodable {
+        var count: Int
+        var min: Double
+        var median: Double
+        var mean: Double
+        var p95: Double
+        var max: Double
+        var spreadFraction: Double
+
+        init(_ s: RunStatistics) {
+            count = s.count
+            min = s.min
+            median = s.median
+            mean = s.mean
+            p95 = s.p95
+            max = s.max
+            spreadFraction = s.spreadFraction
+        }
     }
 
     /// Occupancy for machine consumers: the stored inputs *and* the derived

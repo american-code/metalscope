@@ -64,7 +64,7 @@ final class TraceTests: XCTestCase {
 
     func testJSONIsStableAndHumanReadable() throws {
         let json = String(data: try TraceIO.encode(makeTrace()), encoding: .utf8) ?? ""
-        XCTAssertTrue(json.contains("\"schemaVersion\" : 2"))
+        XCTAssertTrue(json.contains("\"schemaVersion\" : 3"))
         XCTAssertTrue(json.contains("\"kind\" : \"gemm\""))
         XCTAssertTrue(json.contains("\"source\" : \"measured\""))
         XCTAssertTrue(json.contains("\"timingSource\" : \"command-buffer\""))
@@ -189,14 +189,15 @@ final class TraceTests: XCTestCase {
         XCTAssertNil(entries[0].occupancyDeltaPoints)
     }
 
-    /// Re-writing a v1 trace stamps it v2; the v1 content is untouched.
-    func testReadingV1AndWritingBackProducesV2() throws {
+    /// Re-writing a v1 trace stamps it current; the v1 content is untouched.
+    func testReadingV1AndWritingBackProducesTheCurrentSchema() throws {
         var trace = try TraceIO.decode(Data(Self.schemaV1JSON.utf8))
         trace.schemaVersion = Trace.currentSchemaVersion
         let round = try TraceIO.decode(try TraceIO.encode(trace))
-        XCTAssertEqual(round.schemaVersion, 2)
+        XCTAssertEqual(round.schemaVersion, 3)
         XCTAssertEqual(round.kernels.map(\.label), ["ffn.gemm", "act.scale"])
         XCTAssertNil(round.kernels[0].occupancy)
+        XCTAssertNil(round.kernels[0].durationSamplesSeconds)
     }
 
     func testSchemaV2RoundTripsOccupancyAndCounters() throws {
@@ -224,7 +225,138 @@ final class TraceTests: XCTestCase {
         XCTAssertNil(decoded.kernels[0].occupancy)
         let json = String(data: try TraceIO.encode(trace), encoding: .utf8) ?? ""
         XCTAssertTrue(json.contains("\"occupancy\""))
-        XCTAssertTrue(json.contains("\"schemaVersion\" : 2"))
+        XCTAssertTrue(json.contains("\"schemaVersion\" : 3"))
+    }
+
+    // MARK: - Schema v3
+
+    /// A v2 trace, byte for byte as metalscope wrote them before repeats
+    /// existed. Kept as a literal for the same reason as the v1 fixture: a
+    /// future encoder change must not be able to redefine what "a v2 trace" is.
+    private static let schemaV2JSON = """
+    {
+      "createdAt" : "2026-08-26T19:06:18.512Z",
+      "device" : {
+        "counterSets" : [
+          "timestamp"
+        ],
+        "maxThreadgroupMemoryBytes" : 32768,
+        "maxWorkingSetBytes" : 11453251584,
+        "name" : "Apple M1 Pro",
+        "registryID" : 4294970113,
+        "supportsStageBoundarySampling" : true
+      },
+      "kernels" : [
+        {
+          "bytes" : 134217728,
+          "durationSeconds" : 0.000843,
+          "flops" : 16777216,
+          "iterations" : 178,
+          "label" : "act.scale",
+          "occupancy" : {
+            "dispatchCount" : 178,
+            "maxTotalThreadsPerThreadgroup" : 1024,
+            "threadExecutionWidth" : 32,
+            "threadgroupMemoryBytes" : 0,
+            "threadgroupMemoryLimitBytes" : 32768,
+            "threadgroupsPerGrid" : 167773,
+            "threadsPerThreadgroup" : 100,
+            "variantCount" : 1
+          },
+          "precision" : "fp32",
+          "shape" : {
+            "kind" : "elementwise",
+            "n" : 16777216
+          },
+          "timingSource" : "counter-sample-buffer"
+        }
+      ],
+      "notes" : {
+        "command" : "bench",
+        "variant" : "baseline"
+      },
+      "peaks" : {
+        "bandwidthGBs" : 168.13,
+        "chip" : "Apple M1 Pro",
+        "fp32GFLOPS" : 3412.73,
+        "source" : "measured"
+      },
+      "schemaVersion" : 2,
+      "tool" : "metalscope",
+      "toolVersion" : "0.1.0"
+    }
+    """
+
+    func testSchemaV2TracesStillRead() throws {
+        let trace = try TraceIO.decode(Data(Self.schemaV2JSON.utf8))
+        XCTAssertEqual(trace.schemaVersion, 2)
+        XCTAssertEqual(trace.kernels.count, 1)
+        // Everything v2 carried is still read.
+        XCTAssertEqual(trace.kernels[0].occupancy?.threadsPerThreadgroup, 100)
+        XCTAssertEqual(trace.kernels[0].occupancy?.limiter, .executionWidthAlignment)
+        XCTAssertEqual(trace.device.maxThreadgroupMemoryBytes, 32768)
+        // And what v3 added is absent rather than defaulted: a v2 trace was
+        // captured once, and one point must never read as a tight measurement.
+        XCTAssertNil(trace.kernels[0].durationSamplesSeconds)
+        XCTAssertNil(trace.kernels[0].runStatistics)
+    }
+
+    /// A v2 baseline against a v3 candidate must not produce a verdict: one
+    /// side has no spread, so there is nothing to compare a delta against.
+    func testV2TraceStillDiffsButYieldsNoVerdict() throws {
+        let old = try TraceIO.decode(Data(Self.schemaV2JSON.utf8))
+        var new = old
+        new.kernels[0].durationSamplesSeconds = [0.0008, 0.00081, 0.00079, 0.00082, 0.0008]
+        new.kernels[0].durationSeconds = 0.0008
+        let entry = TraceDiff.align(baseline: old.kernels, candidate: new.kernels)[0]
+        XCTAssertEqual(entry.status, .matched)
+        XCTAssertNotNil(entry.speedup)
+        XCTAssertEqual(entry.verdict, .unmeasured)
+        XCTAssertNil(entry.spreadsOverlap)
+        XCTAssertTrue(entry.hasRunStatistics)   // the candidate side still earns a column
+    }
+
+    func testSchemaV3RoundTripsDurationSamples() throws {
+        var trace = makeTrace()
+        let samples = [0.000_51, 0.000_49, 0.000_53, 0.000_50, 0.000_52]
+        trace.kernels[0].durationSamplesSeconds = samples
+        trace.kernels[0].durationSeconds = 0.000_51
+
+        let decoded = try TraceIO.decode(try TraceIO.encode(trace))
+        XCTAssertEqual(decoded, trace)
+        XCTAssertEqual(decoded.kernels[0].durationSamplesSeconds, samples,
+                       "samples must survive in the order they ran")
+        let stats = try XCTUnwrap(decoded.kernels[0].runStatistics)
+        XCTAssertEqual(stats.count, 5)
+        XCTAssertEqual(stats.median, 0.000_51, accuracy: 1e-12)
+        XCTAssertEqual(stats.min, 0.000_49, accuracy: 1e-12)
+        XCTAssertEqual(stats.p95, 0.000_53, accuracy: 1e-12)
+        // The reported duration is the median, not a separately stored number.
+        XCTAssertEqual(decoded.kernels[0].durationSeconds, stats.median, accuracy: 1e-12)
+        // Kernels captured once still serialize without the field.
+        XCTAssertNil(decoded.kernels[1].durationSamplesSeconds)
+        let json = String(data: try TraceIO.encode(trace), encoding: .utf8) ?? ""
+        XCTAssertTrue(json.contains("\"durationSamplesSeconds\""))
+        XCTAssertTrue(json.contains("\"schemaVersion\" : 3"))
+    }
+
+    /// The summary is never stored, so it can never contradict the samples.
+    func testStatisticsAreNotStoredInTheTraceJSON() throws {
+        var trace = makeTrace()
+        trace.kernels[0].durationSamplesSeconds = [0.001, 0.002, 0.003]
+        let json = String(data: try TraceIO.encode(trace), encoding: .utf8) ?? ""
+        for derived in ["\"median\"", "\"p95\"", "\"mean\"", "\"spreadFraction\"", "\"runStatistics\""] {
+            XCTAssertFalse(json.contains(derived), "\(derived) must be derived on read, not stored")
+        }
+    }
+
+    func testTimingSourceTierRankOrdersTheLadder() {
+        XCTAssertEqual(TimingSource.counterSampleBuffer.tierRank, 0)
+        XCTAssertEqual(TimingSource.commandBuffer.tierRank, 1)
+        XCTAssertEqual(TimingSource.host.tierRank, 2)
+        // A record covering several runs claims the worst tier any of them hit.
+        let sources: [TimingSource] = [.counterSampleBuffer, .host, .commandBuffer]
+        XCTAssertEqual(sources.max { $0.tierRank < $1.tierRank }, .host)
     }
 
     func testAlignmentKeyIncludesLabelShapeAndPrecision() {

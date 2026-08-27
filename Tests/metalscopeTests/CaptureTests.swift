@@ -106,6 +106,141 @@ final class CaptureTests: XCTestCase {
         XCTAssertEqual(session.records.count, 2)
     }
 
+    // MARK: - Repeats
+
+    /// A repeated capture must still produce exactly one record — the repeats
+    /// are folded into it, not appended as separate kernels — and the warm-up
+    /// must leave no trace at all.
+    func testRepeatsFoldIntoOneRecordAndWarmupsAreDiscarded() throws {
+        let session = try CaptureSession(device: device)
+        let pipeline = try makePipeline()
+        let count = 1 << 18
+        let x = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+        let y = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+
+        try session.capture(label: "scale", shape: .elementwise(n: count),
+                            iterations: 4, repeats: 5) { region in
+            for _ in 0..<4 {
+                let encoder = try region.makeComputeCommandEncoder()
+                region.dispatchThreads(encoder, pipeline: pipeline,
+                                       threads: MTLSize(width: count, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                encoder.setBuffer(y, offset: 0, index: 0)
+                encoder.setBuffer(x, offset: 0, index: 1)
+                encoder.endEncoding()
+            }
+        }
+
+        XCTAssertEqual(session.records.count, 1)
+        let record = try XCTUnwrap(session.records.first)
+        let samples = try XCTUnwrap(record.durationSamplesSeconds)
+        XCTAssertEqual(samples.count, 5)
+        XCTAssertTrue(samples.allSatisfy { $0 > 0 })
+        XCTAssertEqual(record.iterations, 4, "iterations describe one repeat, not the total")
+
+        let stats = try XCTUnwrap(record.runStatistics)
+        XCTAssertEqual(stats.count, 5)
+        XCTAssertTrue(stats.hasSpread)
+        // The reported duration is the median, and the median is a real sample.
+        XCTAssertEqual(record.durationSeconds, stats.median)
+        XCTAssertTrue(samples.contains(record.durationSeconds))
+        XCTAssertLessThanOrEqual(stats.min, stats.median)
+        XCTAssertLessThanOrEqual(stats.median, stats.p95)
+
+        // Occupancy comes from one repeat, so the dispatch count describes a
+        // region that ran rather than the sum over five of them.
+        XCTAssertEqual(record.occupancy?.dispatchCount, 4)
+    }
+
+    /// The default is one run, and one run records no samples — a v2-shaped
+    /// record. Present-but-single would read as a measured spread of zero.
+    func testASingleRunRecordsNoSamples() throws {
+        let session = try CaptureSession(device: device)
+        let pipeline = try makePipeline()
+        let count = 1 << 16
+        let x = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+        let y = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+
+        try session.captureCompute(label: "scale", shape: .elementwise(n: count)) { encoder in
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(y, offset: 0, index: 0)
+            encoder.setBuffer(x, offset: 0, index: 1)
+            encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        }
+
+        let record = try XCTUnwrap(session.records.first)
+        XCTAssertNil(record.durationSamplesSeconds)
+        XCTAssertNil(record.runStatistics)
+    }
+
+    /// Repeating actually narrows the reported spread, because the warm-up run
+    /// absorbs the clock ramp that would otherwise land on sample one. This is
+    /// the property the whole change exists for, asserted loosely enough to
+    /// survive a busy machine: the median must sit inside the sample range and
+    /// the band must not be absurd.
+    func testRepeatedCaptureProducesACoherentSpread() throws {
+        let session = try CaptureSession(device: device)
+        let pipeline = try makePipeline()
+        let count = 1 << 20
+        let x = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+        let y = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+
+        try session.capture(label: "scale", shape: .elementwise(n: count),
+                            iterations: 32, repeats: 7) { region in
+            for _ in 0..<32 {
+                let encoder = try region.makeComputeCommandEncoder()
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(y, offset: 0, index: 0)
+                encoder.setBuffer(x, offset: 0, index: 1)
+                encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                encoder.endEncoding()
+            }
+        }
+
+        let stats = try XCTUnwrap(session.records.first?.runStatistics)
+        XCTAssertEqual(stats.count, 7)
+        XCTAssertGreaterThan(stats.min, 0)
+        XCTAssertGreaterThanOrEqual(stats.max, stats.p95)
+        XCTAssertGreaterThanOrEqual(stats.mean, stats.min)
+        XCTAssertLessThanOrEqual(stats.mean, stats.max)
+        XCTAssertFalse(stats.spreadFraction.isNaN)
+    }
+
+    /// Every repeat is a fresh region, so a region-level property — here the
+    /// timing tier — has to hold across all of them, not just the first.
+    func testEveryRepeatReachesTheSameTimingTier() throws {
+        let session = try CaptureSession(device: device)
+        guard session.capabilities.canSampleEncoderStages else {
+            throw XCTSkip("device cannot sample at stage boundaries")
+        }
+        let pipeline = try makePipeline()
+        let count = 1 << 16
+        let x = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+        let y = try XCTUnwrap(device.makeBuffer(length: count * 4, options: .storageModePrivate))
+
+        try session.capture(label: "scale", shape: .elementwise(n: count),
+                            iterations: 2, repeats: 4) { region in
+            for _ in 0..<2 {
+                let encoder = try region.makeComputeCommandEncoder()
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(y, offset: 0, index: 0)
+                encoder.setBuffer(x, offset: 0, index: 1)
+                encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                encoder.endEncoding()
+            }
+        }
+
+        let record = try XCTUnwrap(session.records.first)
+        XCTAssertEqual(record.timingSource, .counterSampleBuffer)
+        XCTAssertEqual(record.durationSamplesSeconds?.count, 4)
+        // Stages come from the representative repeat, so there are two of them
+        // rather than eight summed across the four regions.
+        XCTAssertEqual(record.stages?.count, 2)
+    }
+
     func testMultipleEncodersProduceStagesWhenSupported() throws {
         let session = try CaptureSession(device: device)
         guard session.capabilities.canSampleEncoderStages else {

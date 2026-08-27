@@ -42,12 +42,18 @@ struct Workloads {
         let encode: (CaptureRegion, Int) throws -> Void
     }
 
-    /// Encode `runner` `iterations` times into one captured region.
+    /// Encode `runner` `iterations` times into one captured region, `repeats`
+    /// times over.
     /// - Parameter keep: false discards the record (warmup / probe runs).
     @discardableResult
-    func run(_ runner: Runner, label: String, iterations: Int, keep: Bool = true) throws -> KernelRecord {
+    func run(_ runner: Runner,
+             label: String,
+             iterations: Int,
+             repeats: Int = 1,
+             keep: Bool = true) throws -> KernelRecord {
         try session.capture(label: label, shape: runner.shape, precision: runner.precision,
-                            iterations: iterations, notes: runner.notes) { region in
+                            iterations: iterations, repeats: repeats,
+                            notes: runner.notes) { region in
             try runner.encode(region, iterations)
         }
         let record = session.records[session.records.count - 1]

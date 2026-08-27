@@ -45,9 +45,18 @@ enum DiffCommand {
                                candidateThreadgroupOccupancy: entry.candidate?.occupancy?.threadgroupOccupancy,
                                occupancyDeltaPoints: entry.occupancyDeltaPoints,
                                baselineOccupancyLimiter: entry.baseline?.occupancy?.limiter.rawValue,
-                               candidateOccupancyLimiter: entry.candidate?.occupancy?.limiter.rawValue)
+                               candidateOccupancyLimiter: entry.candidate?.occupancy?.limiter.rawValue,
+                               verdict: entry.verdict.rawValue,
+                               spreadsOverlap: entry.spreadsOverlap,
+                               baselineRepeats: entry.baseline?.runStatistics?.count,
+                               candidateRepeats: entry.candidate?.runStatistics?.count,
+                               baselineMinSeconds: entry.baseline?.runStatistics?.min,
+                               baselineP95Seconds: entry.baseline?.runStatistics?.p95,
+                               candidateMinSeconds: entry.candidate?.runStatistics?.min,
+                               candidateP95Seconds: entry.candidate?.runStatistics?.p95)
             }
-            let data = try TraceIO.makeEncoder().encode(JSONDiff(peaks: peaks, kernels: rows))
+            let data = try TraceIO.makeEncoder().encode(
+                JSONDiff(peaks: peaks, verdictRule: TraceDiff.verdictRule, kernels: rows))
             Terminal.out(String(data: data, encoding: .utf8) ?? "{}")
             return
         }
@@ -64,8 +73,10 @@ enum DiffCommand {
         Terminal.out("")
 
         // Only widen the table when at least one aligned kernel has occupancy on
-        // one side — diffs of v1 traces keep the output they always had.
+        // one side — diffs of v1 traces keep the output they always had. The
+        // verdict column follows the same rule for repeat samples.
         let showsOccupancy = diff.entries.contains { $0.hasOccupancy }
+        let showsVerdict = diff.entries.contains { $0.hasRunStatistics }
 
         var columns: [TextTable.Column] = [
             .init("kernel"),
@@ -74,6 +85,9 @@ enum DiffCommand {
             .init("candidate", .right),
             .init("delta", .right),
             .init("speedup", .right),
+        ]
+        if showsVerdict { columns.append(.init("verdict")) }
+        columns += [
             .init("eff a->b", .right),
             .init("d eff", .right),
         ]
@@ -111,6 +125,9 @@ enum DiffCommand {
                     Fmt.duration(entry.candidate?.durationSeconds ?? 0),
                     entry.durationDeltaFraction.map(Fmt.signedPercent) ?? "-",
                     entry.speedup.map { String(format: "%.2fx", $0) } ?? "-",
+                ]
+                if showsVerdict { cells.append(entry.verdict.displayName) }
+                cells += [
                     String(format: "%@ -> %@",
                            placements.baseline.map { Fmt.percent($0.efficiency) } ?? "-",
                            placements.candidate.map { Fmt.percent($0.efficiency) } ?? "-"),
@@ -121,19 +138,36 @@ enum DiffCommand {
             case .onlyInBaseline:
                 cells = [entry.label, entry.shape.descriptionText,
                          Fmt.duration(entry.baseline?.durationSeconds ?? 0),
-                         "absent", "-", "-", "-", "-"]
+                         "absent", "-", "-"]
+                if showsVerdict { cells.append("-") }
+                cells += ["-", "-"]
                 if showsOccupancy { cells.append(threadgroupText(entry)) }
                 cells.append(placements.baseline?.bound.displayName ?? "-")
             case .onlyInCandidate:
                 cells = [entry.label, entry.shape.descriptionText, "absent",
                          Fmt.duration(entry.candidate?.durationSeconds ?? 0),
-                         "-", "-", "-", "-"]
+                         "-", "-"]
+                if showsVerdict { cells.append("-") }
+                cells += ["-", "-"]
                 if showsOccupancy { cells.append(threadgroupText(entry)) }
                 cells.append(placements.candidate?.bound.displayName ?? "-")
             }
             table.addRow(cells)
         }
         Terminal.out(table.rendered(indent: "  "))
+
+        // State the rule wherever the verdict appears, and say plainly when
+        // there is no rule to apply because nobody repeated anything.
+        Terminal.out("")
+        if showsVerdict {
+            Terminal.out("  baseline/candidate are medians over the timed repeats.")
+            Terminal.out("  verdict compares those medians and is withheld (\"no call\") when the two")
+            Terminal.out("  min-p95 spreads overlap: a gap narrower than the run-to-run noise that")
+            Terminal.out("  produced it is not a result. `report` prints each side's spread.")
+        } else {
+            Terminal.out("  both traces are single-run, so every delta below includes run-to-run noise")
+            Terminal.out("  and no winner can be called. Re-capture with `metalscope bench --repeats 5`.")
+        }
 
         let matched = diff.matched
         if !matched.isEmpty {
@@ -145,6 +179,19 @@ enum DiffCommand {
                                 matched.count, diff.entries.count,
                                 Fmt.duration(baselineTotal), Fmt.duration(candidateTotal),
                                 Fmt.signedPercent(delta)))
+            if showsVerdict {
+                let noCall = diff.withinNoise
+                Terminal.out(String(format: "  %d moved beyond both spreads, %d within noise (no call)",
+                                    diff.resolved.count, noCall.count))
+                for entry in noCall {
+                    let s = entry.runStatistics!
+                    Terminal.out(String(format: "  - %@: %@ vs %@ — medians differ by %@, spreads overlap",
+                                        entry.label,
+                                        Fmt.durationRange(s.baseline.min, s.baseline.p95),
+                                        Fmt.durationRange(s.candidate.min, s.candidate.p95),
+                                        entry.durationDeltaFraction.map(Fmt.signedPercent) ?? "-"))
+                }
+            }
             let moved = matched.compactMap { entry -> String? in
                 guard let change = entry.boundChange(peaks: peaks) else { return nil }
                 return "  - \(entry.label): \(change.from.displayName) -> \(change.to.displayName)"
@@ -197,10 +244,21 @@ enum DiffCommand {
         var occupancyDeltaPoints: Double?
         var baselineOccupancyLimiter: String?
         var candidateOccupancyLimiter: String?
+        var verdict: String
+        var spreadsOverlap: Bool?
+        var baselineRepeats: Int?
+        var candidateRepeats: Int?
+        var baselineMinSeconds: Double?
+        var baselineP95Seconds: Double?
+        var candidateMinSeconds: Double?
+        var candidateP95Seconds: Double?
     }
 
     private struct JSONDiff: Encodable {
         var peaks: PeakSet
+        /// The refusal rule travels with the machine-readable output too — a
+        /// consumer reading `verdict` needs to know what withholding one means.
+        var verdictRule: String
         var kernels: [JSONRow]
     }
 }

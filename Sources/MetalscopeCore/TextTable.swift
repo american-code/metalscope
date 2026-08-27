@@ -64,6 +64,26 @@ public enum Fmt {
         return String(format: "%.3f s", seconds)
     }
 
+    /// A compact `low-high unit` span, both ends in the unit the *high* end
+    /// picks so the two numbers can be compared by eye. Used for the `spread`
+    /// column, where a full `Fmt.duration` on each end would double the width.
+    public static func durationRange(_ low: Double, _ high: Double) -> String {
+        guard low.isFinite, high.isFinite, low > 0, high > 0, high >= low else { return "-" }
+        // Same precision per unit as `duration`, so a spread cell and a
+        // time/iter cell in the same row can be read against each other.
+        let scale: Double
+        let unit: String
+        let places: Int
+        if high < 1e-3 {
+            (scale, unit, places) = (1e6, "us", 1)
+        } else if high < 1 {
+            (scale, unit, places) = (1e3, "ms", 3)
+        } else {
+            (scale, unit, places) = (1, "s", 3)
+        }
+        return String(format: "%.\(places)f-%.\(places)f %@", low * scale, high * scale, unit)
+    }
+
     public static func gflops(_ v: Double) -> String {
         if v.isNaN || v <= 0 { return "-" }
         if v >= 1000 { return String(format: "%.2f TF", v / 1000) }

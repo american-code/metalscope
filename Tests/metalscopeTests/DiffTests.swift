@@ -196,6 +196,122 @@ final class DiffTests: XCTestCase {
         XCTAssertEqual(entry.limiterChange?.to, OccupancyLimiter.none)
     }
 
+    // MARK: - Verdicts and the overlap-refusal rule
+
+    private func repeated(_ label: String, samples: [Double]) -> KernelRecord {
+        let sorted = samples.sorted()
+        return KernelRecord(label: label, shape: .norm(n: 1024), precision: .fp32,
+                            durationSeconds: sorted[(sorted.count - 1) / 2],
+                            timingSource: .counterSampleBuffer,
+                            durationSamplesSeconds: samples)
+    }
+
+    private func entry(baseline: KernelRecord, candidate: KernelRecord) -> DiffEntry {
+        TraceDiff.align(baseline: [baseline], candidate: [candidate])[0]
+    }
+
+    /// The whole point: two captures of the *same* unchanged kernel, each noisy,
+    /// must not produce a winner just because their medians differ.
+    func testOverlappingSpreadsRefuseToCallAWinner() {
+        // The §5.6 numbers: an unchanged RMS-norm baseline measured twice.
+        let a = repeated("block.rmsnorm", samples: [77e-6, 195e-6, 91e-6, 120e-6, 88e-6])
+        let b = repeated("block.rmsnorm", samples: [82e-6, 160e-6, 103e-6, 95e-6, 130e-6])
+        let e = entry(baseline: a, candidate: b)
+        XCTAssertEqual(e.verdict, .withinNoise)
+        XCTAssertEqual(e.spreadsOverlap, true)
+        XCTAssertTrue(e.hasRunStatistics)
+        // The medians still differ and the speedup is still computed — the diff
+        // reports the number and declines to interpret it.
+        XCTAssertNotEqual(e.baseline?.durationSeconds, e.candidate?.durationSeconds)
+        XCTAssertNotNil(e.speedup)
+    }
+
+    func testDisjointSpreadsCallTheCandidateFaster() {
+        let a = repeated("k", samples: [200e-6, 210e-6, 205e-6, 220e-6, 215e-6])
+        let b = repeated("k", samples: [100e-6, 104e-6, 101e-6, 110e-6, 106e-6])
+        let e = entry(baseline: a, candidate: b)
+        XCTAssertEqual(e.verdict, .faster)
+        XCTAssertEqual(e.spreadsOverlap, false)
+        XCTAssertEqual(e.verdict.displayName, "faster")
+    }
+
+    func testDisjointSpreadsCallTheCandidateSlower() {
+        let a = repeated("k", samples: [100e-6, 104e-6, 101e-6, 110e-6, 106e-6])
+        let b = repeated("k", samples: [200e-6, 210e-6, 205e-6, 220e-6, 215e-6])
+        let e = entry(baseline: a, candidate: b)
+        XCTAssertEqual(e.verdict, .slower)
+        XCTAssertEqual(e.verdict.displayName, "slower")
+    }
+
+    /// A single-run capture on either side leaves nothing to compare a delta
+    /// against, and the diff says so rather than treating one point as tight.
+    func testSingleRunOnEitherSideWithholdsTheVerdict() {
+        let repeatedSide = repeated("k", samples: [100e-6, 104e-6, 101e-6, 110e-6, 106e-6])
+        let single = record("k", .norm(n: 1024), seconds: 500e-6)
+
+        let candidateSingle = entry(baseline: repeatedSide, candidate: single)
+        XCTAssertEqual(candidateSingle.verdict, .unmeasured)
+        XCTAssertNil(candidateSingle.spreadsOverlap)
+        XCTAssertNil(candidateSingle.runStatistics)
+        XCTAssertTrue(candidateSingle.hasRunStatistics)   // one side still earns a column
+
+        let baselineSingle = entry(baseline: single, candidate: repeatedSide)
+        XCTAssertEqual(baselineSingle.verdict, .unmeasured)
+
+        let bothSingle = entry(baseline: single, candidate: record("k", .norm(n: 1024), seconds: 1e-6))
+        XCTAssertEqual(bothSingle.verdict, .unmeasured)
+        XCTAssertFalse(bothSingle.hasRunStatistics)
+        XCTAssertEqual(bothSingle.verdict.displayName, "-")
+    }
+
+    /// A one-element samples array is still one run. It must not be dressed up
+    /// as a distribution just because the field is present.
+    func testAOneSampleArrayIsStillASingleRun() {
+        let a = repeated("k", samples: [100e-6])
+        let b = repeated("k", samples: [500e-6])
+        let e = entry(baseline: a, candidate: b)
+        XCTAssertEqual(a.runStatistics?.count, 1)
+        XCTAssertEqual(e.verdict, .unmeasured)
+        XCTAssertFalse(e.hasRunStatistics)
+    }
+
+    func testUnmatchedEntriesHaveNoVerdict() {
+        let entries = TraceDiff.align(
+            baseline: [repeated("gone", samples: [1e-6, 2e-6, 3e-6, 4e-6, 5e-6])],
+            candidate: [])
+        XCTAssertEqual(entries[0].status, .onlyInBaseline)
+        XCTAssertEqual(entries[0].verdict, .unmeasured)
+        XCTAssertNil(entries[0].spreadsOverlap)
+    }
+
+    func testTraceDiffPartitionsResolvedAndWithinNoise() {
+        let a = trace([repeated("moved", samples: [200e-6, 210e-6, 205e-6, 220e-6, 215e-6]),
+                       repeated("noise", samples: [77e-6, 195e-6, 91e-6, 120e-6, 88e-6])])
+        let b = trace([repeated("moved", samples: [100e-6, 104e-6, 101e-6, 110e-6, 106e-6]),
+                       repeated("noise", samples: [82e-6, 160e-6, 103e-6, 95e-6, 130e-6])])
+        let diff = TraceDiff(baselineTrace: a, candidateTrace: b)
+        XCTAssertEqual(diff.matched.count, 2)
+        XCTAssertEqual(diff.resolved.map(\.label), ["moved"])
+        XCTAssertEqual(diff.withinNoise.map(\.label), ["noise"])
+    }
+
+    /// The rule is printed with the table, so its wording is part of the
+    /// interface rather than a comment.
+    func testVerdictRuleNamesBothHalvesOfTheTest() {
+        XCTAssertTrue(TraceDiff.verdictRule.contains("medians"))
+        XCTAssertTrue(TraceDiff.verdictRule.contains("min-p95"))
+        XCTAssertTrue(TraceDiff.verdictRule.contains("overlap"))
+        XCTAssertTrue(TraceDiff.verdictRule.contains("no call"))
+    }
+
+    func testVerdictRawValuesAreStableForJSONConsumers() {
+        XCTAssertEqual(DiffEntry.Verdict.faster.rawValue, "faster")
+        XCTAssertEqual(DiffEntry.Verdict.slower.rawValue, "slower")
+        XCTAssertEqual(DiffEntry.Verdict.withinNoise.rawValue, "within-noise")
+        XCTAssertEqual(DiffEntry.Verdict.unmeasured.rawValue, "unmeasured")
+        XCTAssertEqual(DiffEntry.Verdict.withinNoise.displayName, "no call")
+    }
+
     func testTraceDiffPartitionsMatchedAndUnmatched() {
         let a = trace([record("shared", .norm(n: 10), seconds: 1),
                        record("gone", .norm(n: 20), seconds: 1)], notes: ["variant": "baseline"])

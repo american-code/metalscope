@@ -236,6 +236,30 @@ final class TextTableTests: XCTestCase {
         XCTAssertEqual(Fmt.duration(.nan), "-")
     }
 
+    // MARK: - Fmt.durationRange
+
+    /// The `spread` column. Both ends are rendered in the unit the high end
+    /// picks, so the two numbers in a cell can be compared without conversion.
+    func testDurationRangeUsesOneUnitForBothEnds() {
+        XCTAssertEqual(Fmt.durationRange(77e-6, 195e-6), "77.0-195.0 us")
+        XCTAssertEqual(Fmt.durationRange(5e-6, 5e-6), "5.0-5.0 us")
+        // A sub-millisecond low end is still rendered in the high end's unit,
+        // at the same precision `Fmt.duration` uses there.
+        XCTAssertEqual(Fmt.durationRange(0.000_9, 0.001_2), "0.900-1.200 ms")
+        XCTAssertEqual(Fmt.durationRange(0.001_28, 0.001_293), "1.280-1.293 ms")
+        XCTAssertEqual(Fmt.durationRange(0.4, 1.5), "0.400-1.500 s")
+    }
+
+    func testDurationRangeRefusesNonPositiveNaNOrInvertedBounds() {
+        XCTAssertEqual(Fmt.durationRange(0, 1e-3), "-")
+        XCTAssertEqual(Fmt.durationRange(1e-3, 0), "-")
+        XCTAssertEqual(Fmt.durationRange(-1, 1), "-")
+        XCTAssertEqual(Fmt.durationRange(.nan, 1e-3), "-")
+        XCTAssertEqual(Fmt.durationRange(1e-3, .infinity), "-")
+        // A high end below the low end is a bug upstream, not a range.
+        XCTAssertEqual(Fmt.durationRange(200e-6, 100e-6), "-")
+    }
+
     // MARK: - Fmt.gflops / bandwidth / intensity
 
     func testGFLOPSSwitchesToTeraflopsAtAThousand() {
