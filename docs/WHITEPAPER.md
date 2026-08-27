@@ -68,14 +68,17 @@ profiler cannot obtain because it sees a dispatch, not a matmul.
 
 **Credibility is what an instrument reports when reporting is inconvenient.**
 metalscope's calibrated ceilings are the reference the sibling projects in this
-suite score against: triton-metal's 2048 GEMM at 4.66 TFLOP/s is quoted as ~75%
+suite score against: triton-metal's 2048 GEMM at 4.64 TFLOP/s is quoted as 75%
 of the *measured* 6.2 TF M1 Max peak rather than of the 10.4 TF spec figure, and
-its attention comparison cites metalscope's ~744 GF measurement of an
+its attention comparison cites metalscope's 716.6 GF measurement of an
 MPS-composite SDPA — a number that makes the composite it is measured against
-look better. What those papers publish includes the results that do not flatter:
-a GEMM round that landed at ~50% of MPS and missed the 60% it aimed at before a
-second round reached 76%; a codec verdict that went against every codec tested,
-all of them losing above 256 KiB on a 1.06 GB/s Thunderbolt link; a two-node
+look better than the one that comparison timed itself. What those papers publish
+includes the results that do not flatter: a GEMM round that landed at ~50% of MPS
+and missed the 60% it aimed at before a second reached 76%, and a third that moved
+the ratio not at all; a codec verdict that went against every scalar codec tested,
+all of them losing above 256 KiB on the Thunderbolt link they were written for; a
+closed-form
+crossover reported as low by 4–13× on the fabric that tested it; a two-node
 data-parallel result that loses at every model size and crosses 1.0× only between
 a global batch of 1,024 and 4,096.
 

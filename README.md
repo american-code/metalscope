@@ -12,7 +12,8 @@ Instruments cannot: how far is this kernel from the best its shape allows here.
 
 Apple's Instruments GPU tooling exists but isn't ML-aware: it doesn't understand
 attention kernels, doesn't give you roofline analysis against your M-series chip's
-theoretical peaks, and can't diff two kernel versions side by side. metalscope does.
+peaks at all, and can't diff two kernel versions side by side. metalscope does, and
+against peaks it measures rather than peaks a spec sheet asserts.
 
 ## What it does
 
@@ -44,7 +45,11 @@ exercised end-to-end on an M1 Pro: `info`, `calibrate`, `bench`, `profile`,
 region / 93.96% function / 96.57% line coverage of the two library targets).
 CI runs `swift build` and `swift test` on macOS arm64 for every push
 ([workflow](.github/workflows/ci.yml)); GPU-dependent tests skip cleanly on a
-runner without stage-boundary sampling.
+runner without stage-boundary sampling. The hosted runner turns out to present an
+Apple Paravirtual device that exposes no counter sets at all and samples at
+dispatch and blit boundaries rather than stage ones — the mirror image of every
+real Apple part — so CI exercises the timing ladder's fallback on every push. It
+has its own row in [docs/COUNTER-MATRIX.md](docs/COUNTER-MATRIX.md).
 
 New to metalscope? [**docs/USAGE.md**](docs/USAGE.md) is the practical guide —
 the CLI end to end, a complete compiled example of instrumenting your own app,

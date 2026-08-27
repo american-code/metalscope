@@ -14,6 +14,7 @@ One machine can only contribute one row. If you have a chip that isn't here,
 | --- | --- | --- | --- | --- | --- | --- |
 | Apple M1 Pro | macOS 26.5.1 (25F80) | `timestamp` (`GPUTimestamp`) | stage | 1 — `counter-sample-buffer` | 32 KB | measured, metalscope 0.1.0 |
 | Apple M1 Max | macOS 26.5.1 | `timestamp` only | ? | ? | ? | **partial** — see below |
+| Apple Paravirtual device | GitHub-hosted `macos-latest` | *none* | dispatch, blit — **not** stage | 2 — `command-buffer` | ? | measured, CI probe step |
 | Apple M1 / M1 Ultra | — | — | — | — | — | *unfilled* |
 | Apple M2 family | — | — | — | — | — | *unfilled* |
 | Apple M3 family | — | — | — | — | — | *unfilled* |
@@ -49,6 +50,21 @@ particular requires stage-boundary sampling to be confirmed, not assumed.
 
 If you have an M1 Max, [the recipe below](#contributing-a-row) completes this row
 in ten seconds.
+
+### The paravirtual row
+
+The GitHub-hosted `macos-latest` runner presents an **Apple Paravirtual device**,
+and it is the mirror image of every real Apple part in this table: it returns *no*
+counter sets at all — not even `timestamp` — while supporting dispatch- and
+blit-boundary sampling, which no shipping Apple silicon here does, and not stage
+boundaries, which all of them do. Capture therefore falls to tier 2,
+command-buffer GPU time, and the stage-sampling tests `XCTSkip`. That is the
+degradation path working rather than a failure, and CI prints the probe's answer
+on every run (`.github/workflows/ci.yml`) rather than assuming which case it got.
+
+The row is here because it is a measured device, not because anyone should
+profile on it: with no counter sets there is nothing for the resolvers to read,
+and a virtualised GPU's timings are not the machine you are optimising for.
 
 ## What the M1 Pro row means in practice
 

@@ -40,6 +40,7 @@ Apple exposes more.
 Validation in practice: metalscope's calibrated ceilings are the reference the
 sibling projects score against — the triton-metal GEMM attribution table reports
 its throughput as a fraction of metalscope's measured device peak, and its fused
-attention is benchmarked against metalscope's measured SDPA composite. (mccl's
-collectives numbers come from its own fabric benchmark, `mcclbench`, under the
-same measured-denominator reporting standard.)
+attention comparison cites metalscope's measured SDPA composite as the check on
+the composite it times itself, which is the direction that costs it margin.
+(mccl's collectives numbers come from its own fabric benchmark, `mcclbench`,
+under the same measured-denominator reporting standard.)
