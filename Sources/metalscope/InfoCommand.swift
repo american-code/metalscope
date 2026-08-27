@@ -89,7 +89,7 @@ enum InfoCommand {
             }
             Terminal.out(table.rendered(indent: "    "))
             if peaks.source == .measured {
-                Terminal.out("    source: \(store.url.path)")
+                Terminal.out("    source: \((store.url.path as NSString).abbreviatingWithTildeInPath)")
             } else {
                 Terminal.out("    these are community spec-sheet numbers, not your chip — run `metalscope calibrate`")
             }
