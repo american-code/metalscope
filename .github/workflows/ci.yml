@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    # macos-latest is arm64 (Apple silicon) on GitHub-hosted runners.
+    name: swift build + test (macOS arm64)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain and architecture
+        run: |
+          swift --version
+          uname -m
+          sw_vers
+
+      # Whether a hosted runner exposes a Metal device is not something the
+      # runner image documents, and it has changed before. Record the answer in
+      # the log rather than assuming it: the GPU-dependent suite skips cleanly
+      # when there is no device, so the job is green either way, and this line
+      # is how you tell which of the two happened.
+      - name: Metal device availability
+        run: |
+          cat > /tmp/metal-probe.swift <<'SWIFT'
+          import Metal
+          if let device = MTLCreateSystemDefaultDevice() {
+              print("metal-device: \(device.name)")
+              print("counter-sets: \((device.counterSets ?? []).map(\.name).joined(separator: ",")) ")
+          } else {
+              print("metal-device: none — GPU-dependent tests will skip")
+          }
+          SWIFT
+          swiftc -O /tmp/metal-probe.swift -o /tmp/metal-probe
+          /tmp/metal-probe
+
+      - name: Build
+        run: swift build -v
+
+      - name: Test
+        run: swift test
+
+      - name: Build release
+        run: swift build -c release
+
+      # The CLI target is not covered by XCTest (XCTest does not link an
+      # executable target), so exercise it here. `info` runs without a Metal
+      # device; `bench` needs one, so it is gated on the probe above.
+      - name: Smoke-test the CLI
+        run: |
+          ./.build/release/metalscope version
+          ./.build/release/metalscope help
+          ./.build/release/metalscope info || echo "info exited non-zero (no Metal device)"
+          if /tmp/metal-probe | grep -q "metal-device: none"; then
+            echo "no Metal device on this runner — skipping bench/report/diff"
+            exit 0
+          fi
+          ./.build/release/metalscope bench --variant baseline --repeats 3 \
+            --target-ms 20 --size 256 --seq 128 --elements-mb 4 \
+            --output "$RUNNER_TEMP/a.json"
+          ./.build/release/metalscope bench --variant baseline --repeats 3 \
+            --target-ms 20 --size 256 --seq 128 --elements-mb 4 \
+            --output "$RUNNER_TEMP/b.json"
+          ./.build/release/metalscope report "$RUNNER_TEMP/a.json"
+          ./.build/release/metalscope diff "$RUNNER_TEMP/a.json" "$RUNNER_TEMP/b.json"
