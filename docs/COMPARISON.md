@@ -37,6 +37,9 @@ per-chip [COUNTER-MATRIX.md](COUNTER-MATRIX.md): document reality per chip, ligh
 automatically (the resolvers are written and unit-tested against synthetic data) when
 Apple exposes more.
 
-Validation in practice: metalscope's numbers were the instrument for the other two
-projects in this suite — the mccl codec-crossover rule and the triton-metal GEMM
-attribution table were both measured against its calibrated ceilings.
+Validation in practice: metalscope's calibrated ceilings are the reference the
+sibling projects score against — the triton-metal GEMM attribution table reports
+its throughput as a fraction of metalscope's measured device peak, and its fused
+attention is benchmarked against metalscope's measured SDPA composite. (mccl's
+collectives numbers come from its own fabric benchmark, `mcclbench`, under the
+same measured-denominator reporting standard.)
