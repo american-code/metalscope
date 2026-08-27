@@ -25,11 +25,15 @@ jobs:
           uname -m
           sw_vers
 
-      # Whether a hosted runner exposes a Metal device is not something the
-      # runner image documents, and it has changed before. Record the answer in
-      # the log rather than assuming it: the GPU-dependent suite skips cleanly
-      # when there is no device, so the job is green either way, and this line
-      # is how you tell which of the two happened.
+      # What a hosted runner exposes is not something the runner image
+      # documents, and it has changed before. Record the answer in the log
+      # rather than assuming it. As of this writing macos-latest reports an
+      # "Apple Paravirtual device" that exposes *no* counter sets at all — not
+      # even `timestamp` — and supports dispatch/blit but not stage-boundary
+      # sampling, which is the mirror image of every real Apple part. Capture
+      # therefore falls to command-buffer GPU time and the stage-sampling tests
+      # XCTSkip, which is the degradation path working. The job is green whether
+      # or not a device is present; this step is how you tell which case it was.
       - name: Metal device availability
         run: |
           cat > /tmp/metal-probe.swift <<'SWIFT'
@@ -55,21 +59,48 @@ jobs:
 
       # The CLI target is not covered by XCTest (XCTest does not link an
       # executable target), so exercise it here. `info` runs without a Metal
-      # device; `bench` needs one, so it is gated on the probe above.
+      # device; the rest need one, so they are gated on the probe above.
+      #
+      # `calibrate` is not optional here. The runner's GPU has no entry in the
+      # spec-sheet folklore table, so `report` correctly refuses to score
+      # against peaks it does not have — which means measuring them is part of
+      # the smoke test, exactly as it is for a user on a new machine. It writes
+      # to a temp file rather than ~/.metalscope so nothing leaks between steps.
       - name: Smoke-test the CLI
         run: |
-          ./.build/release/metalscope version
-          ./.build/release/metalscope help
-          ./.build/release/metalscope info || echo "info exited non-zero (no Metal device)"
+          set -o pipefail
+          BIN=./.build/release/metalscope
+          $BIN version
+          $BIN help
           if /tmp/metal-probe | grep -q "metal-device: none"; then
-            echo "no Metal device on this runner — skipping bench/report/diff"
+            echo "no Metal device on this runner — skipping the capture commands"
+            $BIN info || echo "info exited non-zero, as expected without a device"
             exit 0
           fi
-          ./.build/release/metalscope bench --variant baseline --repeats 3 \
-            --target-ms 20 --size 256 --seq 128 --elements-mb 4 \
-            --output "$RUNNER_TEMP/a.json"
-          ./.build/release/metalscope bench --variant baseline --repeats 3 \
-            --target-ms 20 --size 256 --seq 128 --elements-mb 4 \
-            --output "$RUNNER_TEMP/b.json"
-          ./.build/release/metalscope report "$RUNNER_TEMP/a.json"
-          ./.build/release/metalscope diff "$RUNNER_TEMP/a.json" "$RUNNER_TEMP/b.json"
+
+          PEAKS="$RUNNER_TEMP/peaks.json"
+          $BIN info
+          $BIN calibrate --quick --sizes 512 --triad-mb 32 --skip-fp16 \
+            --target-ms 40 --peaks-file "$PEAKS"
+          for name in a b; do
+            $BIN bench --variant baseline --repeats 3 --target-ms 20 \
+              --size 256 --seq 128 --heads 4 --elements-mb 4 \
+              --output "$RUNNER_TEMP/$name.json"
+          done
+          $BIN report "$RUNNER_TEMP/a.json" --peaks-file "$PEAKS"
+          $BIN diff "$RUNNER_TEMP/a.json" "$RUNNER_TEMP/b.json" --peaks-file "$PEAKS"
+
+          # The v3 additions must actually be in the trace, and the derived
+          # summary must not be: a green build that silently stopped recording
+          # samples would look exactly like a passing run otherwise.
+          python3 - "$RUNNER_TEMP/a.json" <<'PY'
+          import json, sys
+          trace = json.load(open(sys.argv[1]))
+          assert trace["schemaVersion"] == 3, trace["schemaVersion"]
+          for k in trace["kernels"]:
+              samples = k.get("durationSamplesSeconds")
+              assert samples and len(samples) == 3, (k["label"], samples)
+              assert "median" not in k and "runStatistics" not in k, k["label"]
+              assert k["durationSeconds"] == sorted(samples)[1], k["label"]
+          print(f"trace v3 OK: {len(trace['kernels'])} kernels, 3 samples each, median stored as durationSeconds")
+          PY
