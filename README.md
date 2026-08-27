@@ -210,6 +210,7 @@ Run `metalscope help` for the full flag list.
 | --- | --- |
 | [docs/USAGE.md](docs/USAGE.md) | **start here** — CLI walkthrough with verified output, instrumenting your own app, reading every column, interpreting results, and how to add a counter-set resolver |
 | [docs/WHITEPAPER.md](docs/WHITEPAPER.md) | the argument: motivation, related work, design rationale, evaluation with real numbers, limitations |
+| [docs/COMPARISON.md](docs/COMPARISON.md) | capability coverage vs. Nsight Compute, and the two-chip measured-vs-spec quantification |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | design, the timing ladder, why the peaks are measured, milestone status |
 | [docs/TRACE-FORMAT.md](docs/TRACE-FORMAT.md) | the JSON schema (v2), field by field |
 | [docs/COUNTER-MATRIX.md](docs/COUNTER-MATRIX.md) | what each chip actually exposes, and how to add a row |
