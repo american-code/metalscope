@@ -126,6 +126,20 @@ larger sample: its baseline workflow can lean on counters to explain a
 difference, where metalscope's honest answer to a small one is often to decline
 to name a winner at all (§5.6).
 
+**Where Apple's stack moved, and where this stands.** WWDC 2026 gave Metal
+[TensorOps](https://developer.apple.com/videos/play/wwdc2026/330/), an MSL API
+for tensor math reaching a neural accelerator M5 places "directly in each shader
+core", alongside the other GPU pipelines. That is a second arithmetic ceiling on
+one chip, selected by the path a kernel compiles to, so percentage-of-peak means
+nothing there without saying *which* peak — and §5.2's 1.5–1.7× spec error
+becomes a floor rather than the whole of the problem. Apple's WWDC 2026 profiling
+work went elsewhere: [session 388](https://developer.apple.com/videos/play/wwdc2026/388/)
+is frame-shaped (frames per second, frame interval, MetalFX), with no arithmetic
+intensity, no measured ceiling and no kernel diff. The lever this creates is a
+**TensorOps-aware peak probe** in `calibrate`, so a chip is calibrated on both
+paths and a kernel scored against the one it uses. Spec-level only: no M4 or M5
+part was available here, and nothing is measured on that hardware.
+
 ---
 
 ## 1. Motivation

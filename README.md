@@ -36,6 +36,23 @@ against peaks it measures rather than peaks a spec sheet asserts.
 - **`calibrate`**: measures real peak GEMM/streaming numbers on your chip so
   efficiency percentages are honest.
 
+## Where Apple's stack moved, and where this stands
+
+WWDC 2026 gave Metal **TensorOps**, an MSL API for tensor math reaching a neural
+accelerator that M5 places "directly in each shader core", alongside the other
+GPU pipelines
+([WWDC26 session 330](https://developer.apple.com/videos/play/wwdc2026/330/)).
+M5-class silicon therefore has **two** arithmetic ceilings, chosen by the path a
+kernel takes. A spec sheet already overstates the single reachable fp32 GEMM peak
+by 1.5–1.7×, by different amounts per chip; two ceilings make a spec-based
+roofline less recoverable still — an argument for measuring them, not against.
+
+The next lever is a **TensorOps-aware peak probe** in `calibrate`, so a kernel is
+scored against the ceiling it actually uses. Spec-level only: no M4 or M5
+hardware was available here, and nothing below is measured on it. M4 and M5 are
+the highest-value missing rows in
+[docs/COUNTER-MATRIX.md](docs/COUNTER-MATRIX.md).
+
 ## Status
 
 Milestones 1–6 of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) are implemented and

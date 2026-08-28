@@ -19,6 +19,7 @@ One machine can only contribute one row. If you have a chip that isn't here,
 | Apple M2 family | — | — | — | — | — | *unfilled* |
 | Apple M3 family | — | — | — | — | — | *unfilled* |
 | Apple M4 family | — | — | — | — | — | *unfilled* |
+| Apple M5 family | — | — | — | — | — | *unfilled* |
 
 Columns:
 
@@ -32,6 +33,14 @@ Columns:
   3 = `host`. Tier 1 needs the `timestamp` set *and* stage-boundary sampling.
 - **max threadgroup mem** — `MTLDevice.maxThreadgroupMemoryLength`, the
   denominator for threadgroup-memory pressure in the occupancy analysis.
+
+The **M4 and M5 rows are the highest-value missing ones**. M5 puts a neural
+accelerator in each shader core, reachable from MSL through TensorOps
+([WHITEPAPER.md](WHITEPAPER.md#value-proposition-the-trust-layer-for-a-cuda-alternative)),
+so those parts may expose counter sets no row here has seen — possibly outside
+`MTLCommonCounterSet` entirely, which is exactly the case the recipe below asks
+you to send in. What they expose is unknown to this project: no M4 or M5 hardware
+was available, and no cell of either row is guessed.
 
 ### The partial M1 Max row
 
